@@ -172,6 +172,9 @@ def list_cameras():
 
 def find_camera(name):
     """Index of the first camera whose name contains `name` (case-insensitive), e.g. 'Innomaker'."""
+    if sys.platform == 'darwin':
+        raise IOError(f'macOS: OpenCV cannot find a camera by name ({name!r}); use its number instead, e.g. CAM_INDEX = 0 or 1 '
+                      '(on a MacBook 0 is often its own camera)')
     cams = list_cameras()
     for i, n in cams:
         if name.lower() in n.lower():
@@ -193,10 +196,12 @@ class Camera:
             self.cap = cv2.VideoCapture(index)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))   # compressed: full frame rate at 1280x720
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)                     # ask for no queue (not every backend honours it)
+        if sys.platform != 'darwin':                                 # macOS (AVFoundation) supports neither: leave them alone
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))   # compressed: full frame rate at 1280x720
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)                 # ask for no queue (not every backend honours it)
         if not self.cap.isOpened():
             raise IOError(f'camera {self.name or index} not found')
+        self._wait_for_picture(index)
         self.K = self.dist = None
         self._t_read = 0.0                                          # time of the last read (stale-frame guard)
         if intrinsics is not None:
@@ -313,6 +318,26 @@ class Camera:
         if len(keep) < len(per) and len(keep) >= 8:
             rms, K, dist, rv, tv = _cal([obj_all[k] for k in keep], [img_all[k] for k in keep])
         return K, dist, rms, len(keep)
+
+    def _wait_for_picture(self, index, seconds=3.0):
+        """Read until a frame is not black. macOS gives black frames for a moment after opening, and for good when the program
+        running Python (VS Code, Terminal) has no camera permission: say so here rather than fail later with 'no markers'."""
+        import time as _t
+        t0 = _t.time(); ok = False
+        while _t.time() - t0 < seconds:
+            ok, frame = self.cap.read()
+            if ok and frame is not None and frame.max() > 8:
+                return
+            _t.sleep(0.05)
+        self.cap.release()
+        what = 'gives only black images' if ok else 'gives no images'
+        if sys.platform == 'darwin':
+            hint = ('On macOS: (1) System Settings > Privacy & Security > Camera: allow Visual Studio Code (and Terminal), then quit '
+                    'and reopen VS Code; (2) nothing else may hold the camera: another notebook, Photo Booth, Teams, or a second '
+                    'cv2.VideoCapture in this kernel (release it or restart the kernel); (3) try the other number (0 or 1).')
+        else:
+            hint = 'Check the cable, that nothing else (another notebook, Teams) holds the camera, and the camera number.'
+        raise IOError(f'camera {self.name or index} opened but {what} for {seconds:.0f} s. {hint}')
 
     def drain(self, seconds=0.5):
         """Throw frames away for `seconds`. Use after the arm stops: webcams queue frames, so a read straight after a move can
