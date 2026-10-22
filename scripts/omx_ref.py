@@ -105,3 +105,45 @@ def mount_from_views(T_BEs, T_CMs, T_BM=np.eye(4)):
     U, _, Vt = np.linalg.svd(np.mean([T[:3, :3] for T in Ts], axis=0))
     T = np.eye(4); T[:3, :3] = U @ np.diag([1, 1, np.linalg.det(U @ Vt)]) @ Vt; T[:3, 3] = np.mean([T[:3, 3] for T in Ts], axis=0)
     return T
+
+# ---- Lab 3 Task 1: Forward kinematics of the OMX in NumPy
+def roty(a):
+    c, s = np.cos(a), np.sin(a); return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+def rotz(a):
+    c, s = np.cos(a), np.sin(a); return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+def omx_fk(q, p=NOM):
+    """Joint angles q (4,) rad, link parameters p -> 4x4 end-effector pose in the base frame."""
+    R1 = rotz(q[0]); R2 = R1 @ roty(q[1]); R3 = R2 @ roty(q[2]); R4 = R3 @ roty(q[3])
+    t = np.array([0, 0, p['d1']]) + R2 @ [p['l2x'], 0, p['l2z']] + R3 @ [p['l3'], 0, 0] + R4 @ [p['l4'], 0, 0]
+    T = np.eye(4); T[:3, :3] = R4; T[:3, 3] = t; return T
+
+# ---- Lab 3 Task 2: Denavit-Hartenberg table and its forward kinematics
+def dh_table(p=NOM):
+    """Standard DH rows [theta_offset, d, a, alpha] for joints 1..4 (4x4 array)."""
+    a2 = np.hypot(p['l2x'], p['l2z']); beta = np.arctan2(p['l2x'], p['l2z'])
+    return np.array([[0.0, p['d1'], 0.0, -np.pi / 2],
+                     [beta - np.pi / 2, 0.0, a2, 0.0],
+                     [np.pi / 2 - beta, 0.0, p['l3'], 0.0],
+                     [0.0, 0.0, p['l4'], 0.0]])
+
+def fk_dh(q, dh):
+    """Standard DH forward kinematics -> 4x4 pose."""
+    T = np.eye(4)
+    for qi, (off, d, a, al) in zip(q, dh):
+        th = qi + off; ct, st, ca, sa = np.cos(th), np.sin(th), np.cos(al), np.sin(al)
+        A = np.array([[ct, -st * ca, st * sa, a * ct], [st, ct * ca, -ct * sa, a * st], [0, sa, ca, d], [0, 0, 0, 1]])
+        T = T @ A
+    return T
+
+# ---- Lab 3 Task 3: Validation statistics and the error field
+def error_stats(pred, meas):
+    """N x 3 arrays (m) -> [mean_mm, max_mm, bias_x_mm, bias_y_mm]."""
+    d = np.asarray(meas) - np.asarray(pred); n = 1e3 * np.linalg.norm(d, axis=1)
+    return np.array([n.mean(), n.max(), 1e3 * d[:, 0].mean(), 1e3 * d[:, 1].mean()])
+
+def plot_error_field(pred, meas, scale=10):
+    """Top view: arrows from predicted to measured, exaggerated by `scale`."""
+    pred, meas = np.asarray(pred), np.asarray(meas); d = meas - pred
+    plt.figure(figsize=(7, 5)); plt.quiver(pred[:, 0], pred[:, 1], d[:, 0] * scale, d[:, 1] * scale, angles='xy', scale_units='xy', scale=1, color='r')
+    plt.plot(pred[:, 0], pred[:, 1], 'k.'); plt.axis('equal'); plt.grid(); plt.xlabel('x (m)'); plt.ylabel('y (m)')
+    plt.title(f'error field (x{scale}); mean {error_stats(pred, meas)[0]:.1f} mm'); plt.show()
