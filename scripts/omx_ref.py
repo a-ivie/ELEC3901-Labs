@@ -147,3 +147,79 @@ def plot_error_field(pred, meas, scale=10):
     plt.figure(figsize=(7, 5)); plt.quiver(pred[:, 0], pred[:, 1], d[:, 0] * scale, d[:, 1] * scale, angles='xy', scale_units='xy', scale=1, color='r')
     plt.plot(pred[:, 0], pred[:, 1], 'k.'); plt.axis('equal'); plt.grid(); plt.xlabel('x (m)'); plt.ylabel('y (m)')
     plt.title(f'error field (x{scale}); mean {error_stats(pred, meas)[0]:.1f} mm'); plt.show()
+
+# ---- Lab 4 Task 1: Planar two-link inverse kinematics
+def planar_2r(rw, zw, a2, l3, elbow='up'):
+    """Planar 2R IK -> [phi2, phi3] (rad) or None if out of reach."""
+    # the elbow, equation (3): the law of cosines
+    c3 = (rw ** 2 + zw ** 2 - a2 ** 2 - l3 ** 2) / (2 * a2 * l3)
+    if abs(c3) > 1:
+        return None                      # out of reach: no triangle
+    # equation (4): the sign of the sine is the elbow choice
+    s3 = np.sqrt(1 - c3 ** 2)
+    if elbow == 'up':
+        s3 = -s3                         # elbow up: the relative angle is negative
+    phi3 = np.arctan2(s3, c3)
+    # the shoulder, equation (5): towards the wrist point, less the angle the bent elbow adds
+    phi2 = np.arctan2(zw, rw) - np.arctan2(l3 * s3, a2 + l3 * c3)
+    return np.array([phi2, phi3])
+
+# ---- Lab 4 Task 2: Full inverse kinematics of the OMX
+def omx_ik(p, pitch, elbow='up', par=NOM):
+    """Base-frame position p (3,), tool pitch below horizontal (rad) -> q (4,) or None. elbow: 'up', 'down' or 'any'."""
+    if elbow == 'any':                   # try elbow up first, then elbow down
+        q = omx_ik(p, pitch, 'up', par)
+        if q is None:
+            q = omx_ik(p, pitch, 'down', par)
+        return q
+    x = p[0]
+    y = p[1]
+    z = p[2]
+    # step 1, equation (6): joint 1 turns the arm's plane onto the target
+    q1 = np.arctan2(y, x)
+    r = np.sqrt(x ** 2 + y ** 2)
+    # step 2, equation (7): the wrist point, l4 back along the tool, measured from the shoulder
+    rw = r - par['l4'] * np.cos(pitch)
+    zw = z - par['d1'] + par['l4'] * np.sin(pitch)
+    # step 3: the two-link problem (your Task 1)
+    a2 = np.sqrt(par['l2x'] ** 2 + par['l2z'] ** 2)
+    beta = np.arctan2(par['l2x'], par['l2z'])
+    sol = planar_2r(rw, zw, a2, par['l3'], elbow)
+    if sol is None:
+        return None                      # out of reach
+    phi2 = sol[0]
+    phi3 = sol[1]
+    # step 4, equation (8): the OMX's own angles (zero with link 2 at beta, positive = nose down)
+    q2 = (np.pi / 2 - beta) - phi2
+    q3 = (beta - np.pi / 2) - phi3
+    q4 = pitch - q2 - q3
+    q = np.array([q1, q2, q3, q4])
+    # an answer outside the joint limits is no answer
+    if np.any(q < Q_LIM[:, 0]) or np.any(q > Q_LIM[:, 1]):
+        return None
+    return q
+
+# ---- Lab 4 Task 3: Placing the camera with IK
+def camera_ik(p_C, view_pitch, T_EC, elbow='up', par=NOM):
+    """Lens position p_C (3,) in {B}, optical axis view_pitch (rad) below horizontal, mount T_EC -> q (4,) or None."""
+    if hasattr(T_EC, 'A'):
+        T = T_EC.A                       # an SE3: take its 4 x 4 matrix
+    else:
+        T = np.array(T_EC)
+    # equation (13): the tool pitch is the view pitch less the mount's tilt
+    alpha = np.arctan2(-T[2, 2], T[0, 2])
+    pitch = view_pitch - alpha
+    # equation (14): step back from the lens to the tool point, in the arm's plane
+    ox = T[0, 3]
+    oz = T[2, 3]
+    x = p_C[0]
+    y = p_C[1]
+    z_C = p_C[2]
+    q1 = np.arctan2(y, x)
+    r_C = np.sqrt(x ** 2 + y ** 2)
+    r = r_C - ox * np.cos(pitch) - oz * np.sin(pitch)
+    z = z_C + ox * np.sin(pitch) - oz * np.cos(pitch)
+    if r <= 0:
+        return None                      # the tool point would be behind the joint-1 axis
+    p_tool = [r * np.cos(q1), r * np.sin(q1), z]
+    return omx_ik(p_tool, pitch, elbow, par)   # your Task 2
