@@ -37,6 +37,7 @@ except ImportError:  # allow import on machines without the SDK
     _SDK = False
 
 # ---- Dynamixel X-series control table, XL430-W250 + XL330-M288 (Protocol 2.0) ----
+ADDR_RETURN_DELAY = 9       # 1 byte, EEPROM, 2 us units (factory 250 = 500 us)
 ADDR_DRIVE_MODE = 10        # 1 byte (bit 2: time-based profile)
 ADDR_OPERATING_MODE = 11    # 1 byte
 ADDR_HOMING_OFFSET = 20     # 4 bytes
@@ -65,6 +66,9 @@ MODE_CURRENT_POSITION = 5   # current-based position control (torque-limited)
 TICKS_PER_REV = 4096
 RAD_PER_TICK = 2 * np.pi / TICKS_PER_REV
 VEL_UNIT_RAD_S = 0.229 * 2 * np.pi / 60   # rad/s per raw unit (both servo types)
+ACC_UNIT_RAD_S2 = 214.577 * 2 * np.pi / 3600   # rad/s^2 per raw Profile Acceleration unit (velocity-based units)
+PROFILE_MS_MAX = 32737          # time-based profile: the longest move or ramp time the registers take (ms)
+DEFAULT_PROFILE = (40, 10)      # speed limits until set_profile() is called (velocity-based units)
 CURRENT_UNIT_A = 1.0e-3         # XL330: Present/Goal Current unit is 1 mA
 LOAD_UNIT = 1.0e-3              # XL430: Present Load unit is 0.1 % of maximum (signed)
 # stall figures from the e-manual: XL430-W250 1.4 N m at 1.3 A (11.1 V); XL330-M288 0.52 N m at 1.47 A (5 V)
@@ -85,8 +89,9 @@ HOME_Q = np.radians([0.0, -60.0, 60.0, 30.0])   # = omx_model.HOME_Q
 # (30 Sep 2026: -28.0, -54.5, 94.1, -0.8 deg), rounded 5 deg AWAY from contact: tip ~22 mm above the table. With torque off
 # the arm then settles the last few mm; nothing is pressed (the earlier (-30, -50, 85, 80) pose drove the gripper into
 # the table and base and tripped its voltage protection). Reached via REST_VIA_Q (home with the wrist already up): with
-# velocity-based profiles the joints arrive at different times, and a direct home -> rest move could put the tip 23 mm
-# below the table if joints 2-3 finished before the wrist; via the waypoint the tip stays >= 22 mm for any joint order.
+# velocity-based profiles (until 30 Oct 2026) the joints arrived at different times, and a direct home -> rest move could put
+# the tip 23 mm below the table if joints 2-3 finished before the wrist; via the waypoint the tip stays >= 22 mm for any joint
+# order. The time-based profile moves the joints together; the waypoint is kept anyway (see omx_model.REST_Q).
 REST_Q = np.radians([-30.0, -55.0, 95.0, -5.0])   # = omx_model.REST_Q
 REST_VIA_Q = np.radians([0.0, -60.0, 60.0, -5.0])   # = omx_model.REST_VIA_Q
 HW_ERROR_BITS = {0: 'input voltage', 2: 'overheating', 3: 'motor encoder', 4: 'electrical shock', 5: 'overload'}
@@ -124,6 +129,57 @@ GRIPPER_CURRENT_LIMIT = 600
 ROBOTIS_USB_VID = 0x2F5D           # OpenRB-150 / U2D2
 
 
+def profile_times(D, V, A):
+    """One trapezoid shared by every joint of a move: (T, ta) in s, the move time and the ramp (acceleration) time.
+    D: each joint's distance to go (rad); V, A: its speed and acceleration limits (rad/s, rad/s^2). V = 0: no profile on
+    that joint (left out); A = 0: no acceleration limit (ta = 0, a constant-speed move). Every joint follows the same shape
+    scaled by its distance, so all arrive together, and the joint with the furthest to go runs exactly the trapezoid a
+    velocity-based profile would give it alone: T = D/V + V/A, or 2 sqrt(D/A) when it never reaches V."""
+    D, V, A = np.abs(np.asarray(D, float)), np.asarray(V, float), np.asarray(A, float)
+    lim = V > 0
+    if not np.any(lim & (D > 0)):
+        return 0.0, 0.0
+    d, v = D[lim], V[lim]
+    a = np.where(A[lim] > 0, A[lim], np.inf)
+    ta = float(np.max(np.minimum(v / a, np.sqrt(d / a))))     # the longest ramp any joint needs
+    T = max(2 * ta, float(np.max(ta + d / v)))                # cruise: no joint above its speed
+    if ta > 0:
+        T = max(T, float(np.max(ta + d / (a * ta))))          # ramps: no joint above its acceleration
+    return T, ta
+
+
+STREAM_START_TOL = np.radians(5)   # stream(): the first sample must be this close to where the arm is
+
+
+def check_stream(qs, dt, v_lim, q_now):
+    """Refuse a stream the servos should not run (D. Jones, 2 Nov 2026): every step between samples must stay within each joint's
+    set_profile speed limit v_lim (rad/s; 0 = no limit), and the first sample within STREAM_START_TOL of q_now (move_q there
+    first). On the bench the servos followed samples far faster than the limit (166 deg/s at set_profile(40, 10)), so the
+    limit only holds if the samples respect it. Raises ValueError saying which joint and sample."""
+    qs = np.asarray(qs, float)
+    if dt <= 0:
+        raise ValueError(f'stream refused: dt must be positive (got {dt})')
+    off = np.abs(qs[0] - np.asarray(q_now, float))
+    if off.max() > STREAM_START_TOL:
+        j = int(np.argmax(off))
+        raise ValueError(f'stream refused: the first sample is {np.degrees(off[j]):.1f} deg from where joint {j + 1} is. '
+                         'Move there first: arm.move_q(qs[0], wait=True)')
+    if len(qs) < 2:
+        return
+    need = np.abs(np.diff(qs, axis=0)) / dt                       # each joint's speed between consecutive samples
+    v_lim = np.asarray(v_lim, float)
+    ratio = np.zeros(qs.shape[1])
+    for j in range(qs.shape[1]):
+        if v_lim[j] > 0:
+            ratio[j] = need[:, j].max() / v_lim[j]
+    j = int(np.argmax(ratio))                                     # the joint furthest over its limit
+    if ratio[j] > 1.01:                                           # 1 %: rounding in the samples
+        k = int(np.argmax(need[:, j]))
+        raise ValueError(f'stream refused: joint {j + 1} would need {np.degrees(need[k, j]):.0f} deg/s between samples {k} '
+                         f'and {k + 1}, above its set_profile limit of {np.degrees(v_lim[j]):.0f} deg/s. Use more samples '
+                         'or a longer dt, or raise the limit with arm.set_profile()')
+
+
 def find_port():
     """Serial port of the OpenRB-150 (ROBOTIS USB vendor id). Raises if none or more than one is connected."""
     from serial.tools import list_ports
@@ -142,6 +198,11 @@ def _s32(v):
     return v - 4294967296 if v > 2147483647 else v
 
 
+def _le32(v):
+    v = int(v) & 0xFFFFFFFF
+    return [v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF]
+
+
 class OMX:
     """Thin wrapper around the Dynamixel SDK for the OpenMANIPULATOR-X."""
 
@@ -149,13 +210,17 @@ class OMX:
         """port: 'auto' finds the OpenRB-150 by its ROBOTIS USB vendor id (find_port); or give it, e.g. 'COM4'.
         gains: 'standard' (ROBOTIS OMX-F, P/I/D 1000/0/1000) or 'precision' (1000/1000/1200: the I term removes the 1-4 deg
         a gravity-loaded joint otherwise stops short by; it made the first arm shake, 30 Sep 2026), see GAIN_SETS. On connect every arm servo (IDs 11-15) is put on a
-        velocity-based profile (drive mode bit 2 cleared), so set_profile() takes speeds, never move times; the gripper
-        (ID 16) keeps its own configuration."""
+        time-based profile (drive mode bit 2 set, as ROBOTIS ship the OMX-F; D. Jones, 30 Oct 2026). set_profile() still
+        takes speeds; move_q() turns them into one move time for all four joints (profile_times), so the joints arrive
+        together. The gripper (ID 16) keeps its own velocity-based configuration."""
         self.simulate = simulate or not _SDK
         self.port_name = 'simulated'
         self.gains = gains
         self._alerted = set()
         self._q_sim = np.zeros(4)
+        self._lim = {i: DEFAULT_PROFILE for i in ARM_SERVO_IDS}   # speed limits per arm servo (set_profile units)
+        self._timed = set()                                      # servos on a time-based profile (_use_time_profiles)
+        self._warned_long = False
         self._grip_sim = GRIPPER_OPEN_TICKS
         if self.simulate:
             if not _SDK and not simulate:
@@ -175,11 +240,13 @@ class OMX:
         for i in JOINT_IDS:
             self._sr.addParam(i)
         self._sw = GroupSyncWrite(self.port, self.pkt, ADDR_GOAL_POSITION, 4)
+        self._swp = GroupSyncWrite(self.port, self.pkt, ADDR_PROFILE_ACCEL, 12)   # ramp time, move time, goal: one packet
         self._alerted = set()
         try:
             self._clear_hardware_errors()
             self._setup_gripper()
-            self._use_velocity_profiles()
+            self._use_time_profiles()
+            self._no_return_delay()
             self.set_gains(STANDARD, ids=[GRIPPER_ID])           # gripper: ROBOTIS standard gains, never precision
             self.set_gains(gains)
         except Exception:
@@ -202,7 +269,7 @@ class OMX:
 
     def _setup_gripper(self):
         """Gripper to current-based position mode with a 600 mA limit (see GRIPPER_MODE). Mode and limit are EEPROM: they are
-        written only while the gripper's torque is off. With torque on it may be holding something (the pen), so it is left
+        written only while the gripper's torque is off. With torque on it may be holding something, so it is left
         alone with a warning; the goal current (RAM) is always set."""
         mode = self._read(GRIPPER_ID, ADDR_OPERATING_MODE, 1)
         limit = self._read(GRIPPER_ID, ADDR_CURRENT_LIMIT, 2)
@@ -220,21 +287,62 @@ class OMX:
         self._write(GRIPPER_ID, ADDR_GOAL_CURRENT, 2, GRIPPER_CURRENT_LIMIT)
         self.set_profile(*GRIPPER_PROFILE, ids=[GRIPPER_ID])    # RAM: gentle open/close (see GRIPPER_PROFILE)
 
-    def _use_velocity_profiles(self):
-        """Clear drive-mode bit 2 (time-based profile) on the arm servos, keeping the other bits (e.g. reverse direction).
-        ROBOTIS configure the OMX-F time-based (profile registers = move time in ms), which would make set_profile(60, 20)
-        mean 'every move in 60 ms'. Drive mode is EEPROM: it can only be written with torque off, so a servo that is
-        time-based with torque ON is refused rather than switched off (the arm would drop)."""
+    def _use_time_profiles(self):
+        """Set drive-mode bit 2 (time-based profile) on the arm servos, keeping the other bits (e.g. reverse direction).
+        Until 30 Oct 2026 this wrapper cleared it (velocity-based: each joint ran its own trapezoid and arrived when it
+        arrived). Now the profile registers hold a ramp time and a move time in ms, written by move_q() with every goal.
+        Drive mode is EEPROM: it can only be written with torque off. A velocity-based servo found with torque ON is left as
+        it is, with a warning: the arm then works as before, its joints not synchronised (rest, torque off, reconnect)."""
+        self._timed = set()
         for i in ARM_SERVO_IDS:
             dm = self._read(i, ADDR_DRIVE_MODE, 1)
-            if dm & 0x04:
+            if not dm & 0x04:
                 if self._read(i, ADDR_TORQUE_ENABLE, 1):
-                    raise IOError(f'servo {i} uses a time-based profile (drive mode {dm}) with torque ON. Support the arm, '
-                                  'switch torque off (or power-cycle it), then connect again.')
-                self._write(i, ADDR_DRIVE_MODE, 1, dm & ~0x04)
-                if self._read(i, ADDR_DRIVE_MODE, 1) & 0x04:
-                    raise IOError(f'servo {i}: could not switch to a velocity-based profile')
-                print(f'servo {i}: drive mode {dm} -> {dm & ~0x04} (velocity-based profile)')
+                    print(f'WARNING: servo {i} is on a velocity-based profile with torque on; left as it is (joints not '
+                          'synchronised). Rest the arm, switch torque off and connect again to switch it.')
+                    continue
+                self._write(i, ADDR_DRIVE_MODE, 1, dm | 0x04)
+                if not self._read(i, ADDR_DRIVE_MODE, 1) & 0x04:
+                    raise IOError(f'servo {i}: could not switch to a time-based profile')
+                print(f'servo {i}: drive mode {dm} -> {dm | 0x04} (time-based profile)')
+            self._timed.add(i)
+        if not set(JOINT_IDS) <= self._timed:                    # the shared move time needs all four joints: the
+            for i in set(JOINT_IDS) & self._timed:               # time-based ones go back to velocity-based
+                if self._read(i, ADDR_TORQUE_ENABLE, 1):
+                    raise IOError(f'servo {i} is time-based with torque on while another joint is velocity-based. Support '
+                                  'the arm, switch torque off (or power-cycle it), then connect again.')
+                self._write(i, ADDR_DRIVE_MODE, 1, self._read(i, ADDR_DRIVE_MODE, 1) & ~0x04)
+            self._timed -= set(JOINT_IDS)
+        for i in set(ARM_SERVO_IDS) - self._timed:               # velocity-based: the limits go straight to the registers
+            self.set_profile(*DEFAULT_PROFILE, ids=[i])
+
+    def _no_return_delay(self):
+        """Return Delay Time 0 on every servo, as ROBOTIS configure the OMX-F (omx_f.ros2_control.xacro): each servo
+        answers at once instead of after the factory 500 us, which shortens every read (the four joints: 4.47 -> 1.24 ms
+        median on the bench arm, 2 Nov 2026). EEPROM: written only with torque off; a servo found with torque on is left as it is."""
+        for i in ALL_SERVO_IDS:
+            if self._read(i, ADDR_RETURN_DELAY, 1) == 0 or self._read(i, ADDR_TORQUE_ENABLE, 1):
+                continue
+            self._write(i, ADDR_RETURN_DELAY, 1, 0)
+
+    def _profile_ms(self, ids, D, move_time=None):
+        """[(ramp ms, move ms)] per servo for one move of distances D (rad) under each servo's speed limits. move_time (s):
+        stream() asks for one sample period and no ramp (straight lines between samples); a sample further than the speed
+        limit allows takes longer. A servo with no limit (set_profile(0, ...)) gets (0, 0): no profile."""
+        V = np.array([self._lim[i][0] for i in ids], float) * VEL_UNIT_RAD_S
+        A = np.array([self._lim[i][1] for i in ids], float) * ACC_UNIT_RAD_S2
+        if move_time is None:
+            T, ta = profile_times(D, V, A)
+        else:
+            T, ta = max(profile_times(D, V, np.zeros_like(A))[0], move_time), 0.0
+        T_ms = int(np.ceil(T * 1000))
+        if T_ms > PROFILE_MS_MAX:
+            if not self._warned_long:
+                print(f'WARNING: moves longer than {PROFILE_MS_MAX / 1000:.1f} s are cut to that time (faster than the profile)')
+                self._warned_long = True
+            T_ms = PROFILE_MS_MAX
+        ta_ms = min(int(round(ta * 1000)), T_ms // 2)
+        return [(0, 0) if V[k] == 0 else (ta_ms, max(T_ms, 1)) for k in range(len(ids))]
 
     def set_gains(self, name='standard', ids=None):
         """Position P/I/D from GAIN_SETS ('standard' or 'precision') on the arm servos (IDs 11-15; the gripper only ever
@@ -315,7 +423,7 @@ class OMX:
             self.set_gains(STANDARD, ids=[GRIPPER_ID])
         if arm_ids:
             self.set_gains(self.gains, ids=arm_ids)
-            self.set_profile(*getattr(self, '_profile', (40, 10)), ids=arm_ids)
+            self.set_profile(*getattr(self, '_profile', DEFAULT_PROFILE), ids=arm_ids)
         self.torque(True, ids=bad)
         return bad
 
@@ -338,7 +446,7 @@ class OMX:
         for i in (ids or JOINT_IDS + [ROLL_ID, GRIPPER_ID]):
             self._write(i, ADDR_TORQUE_ENABLE, 1, 1 if on else 0)
         if on and (ids is None or ROLL_ID in ids):
-            self._write(ROLL_ID, ADDR_GOAL_POSITION, 4, ROLL_TICKS)      # keep the wrist roll (joint 5) locked at zero
+            self._roll_goal(ROLL_TICKS)                                  # keep the wrist roll (joint 5) locked at zero
 
     def set_mode(self, mode, ids=None):
         """Operating mode must be changed with torque OFF. Current-based position mode (5) and current mode (0) exist only
@@ -353,10 +461,15 @@ class OMX:
     def set_profile(self, velocity=60, acceleration=20, ids=None):
         """Profile velocity (0.229 rpm units) and acceleration (214.577 rev/min^2 units).
         Smaller = gentler. 0 = no limit (do NOT use 0 in the teaching lab). Default: joints 1-4 AND the wrist roll (ID 15),
-        which otherwise has no limit and snaps round when commanded."""
+        which otherwise has no limit and snaps round when commanded. On the time-based arm servos the limits are kept here
+        and turned into a move time on every move (profile_times): the joint with the furthest to go moves exactly as a
+        velocity-based profile with these values would move it, and the others are slowed to arrive with it."""
         for i in (ids or ARM_SERVO_IDS):
-            self._write(i, ADDR_PROFILE_VELOCITY, 4, velocity)
-            self._write(i, ADDR_PROFILE_ACCEL, 4, acceleration)
+            if i in ARM_SERVO_IDS:
+                self._lim[i] = (velocity, acceleration)
+            if i not in self._timed:
+                self._write(i, ADDR_PROFILE_VELOCITY, 4, velocity)
+                self._write(i, ADDR_PROFILE_ACCEL, 4, acceleration)
         if ids is None:
             self._profile = (velocity, acceleration)            # re-applied by recover() after a reboot
 
@@ -429,12 +542,13 @@ class OMX:
         """Approximate joint torque (N m) = load fraction x stall torque."""
         return self.read_load() * STALL_TORQUE
 
-    def move_q(self, q, wait=False, tol=0.02, timeout=8.0, still_tol=0.003, still_s=0.3, roll=None, gripper=None):
+    def move_q(self, q, wait=False, tol=0.02, timeout=8.0, still_tol=0.003, still_s=0.3, roll=None, gripper=None, _move_time=None, _prev=None):
         """Command joint angles (rad) of joints 1-4. Clips to Q_LIM. Optional: roll (rad, joint 5, clipped to ROLL_LIM) and
         gripper ('open', 'closed' or a fraction 0 closed .. 1 open). Left as None they are MASKED - the roll stays held at zero
         and the gripper where it is - which is what every lab uses. wait=True blocks until the joints are within tol (rad) of q, OR have
         stopped moving (< still_tol rad for still_s): with the standard gains (I = 0) a gravity-loaded joint stops 1-4 deg
-        short and never gets within tol, which used to cost the full timeout on every waited move."""
+        short and never gets within tol, which used to cost the full timeout on every waited move. The four joints share one
+        move time (profile_times), so they arrive together."""
         q = np.clip(np.asarray(q, dtype=float), Q_LIM[:, 0], Q_LIM[:, 1])
         if roll is not None:
             self.set_roll(roll)
@@ -443,17 +557,29 @@ class OMX:
         if self.simulate:
             self._q_sim = q
             return
-        self._sw.clearParam()
-        for i, t in zip(JOINT_IDS, self.rad_to_ticks(q)):
-            t = int(t)
-            self._sw.addParam(i, [t & 0xFF, (t >> 8) & 0xFF, (t >> 16) & 0xFF, (t >> 24) & 0xFF])
-        if self._sw.txPacket() != COMM_SUCCESS:
+        if set(JOINT_IDS) <= self._timed:                        # time-based: ramp time, move time and goal in one packet
+            q_from = self.read_q() if _prev is None else _prev   # stream(): the step from the previous sample
+            prof = self._profile_ms(JOINT_IDS, q - q_from, _move_time)
+            sw = self._swp
+            sw.clearParam()
+            for i, t, (ta_ms, T_ms) in zip(JOINT_IDS, self.rad_to_ticks(q), prof):
+                sw.addParam(i, _le32(ta_ms) + _le32(T_ms) + _le32(t))
+        else:
+            sw = self._sw
+            sw.clearParam()
+            for i, t in zip(JOINT_IDS, self.rad_to_ticks(q)):
+                sw.addParam(i, _le32(t))
+        if sw.txPacket() != COMM_SUCCESS:
             raise IOError('sync write failed')
         if wait:
             t0 = time.time(); q_prev = self.read_q(); t_still = None
+            T_move = max(T_ms for _, T_ms in prof) / 1000 if sw is self._swp else 0.0   # a short move is not done early
             while time.time() - t0 < timeout:
                 time.sleep(0.02)
                 q_now = self.read_q()
+                if time.time() - t0 < T_move:
+                    q_prev = q_now
+                    continue
                 if np.max(np.abs(q_now - q)) < tol:
                     return
                 if np.max(np.abs(q_now - q_prev)) < still_tol:
@@ -465,11 +591,20 @@ class OMX:
                 q_prev = q_now
 
     def stream(self, qs, dt):
-        """Stream a trajectory (N x 4 array) at fixed period dt; returns logged (t, q_meas)."""
+        """Stream a trajectory (N x 4 array) at fixed period dt; returns logged (t, q_meas). On the time-based servos each
+        sample is a move of one period dt with no ramp, so the servos run straight lines between your samples (a sample the
+        speed limit cannot reach in dt takes longer, and the arm falls behind). Each move time comes from the step between
+        your samples, not from the angles read (the arm runs behind them: timing from the readings slowed every sample
+        further, about 140 ms of lag at set_profile(40, 10) on the bench, 2 Nov 2026). Refused before anything moves
+        (check_stream) if a step between samples is faster than set_profile allows, or the first sample is not where the arm is."""
+        qs = np.clip(np.asarray(qs, dtype=float), Q_LIM[:, 0], Q_LIM[:, 1])
+        check_stream(qs, dt, [self._lim[i][0] * VEL_UNIT_RAD_S for i in JOINT_IDS], self.read_q())
         log_t, log_q = [], []
         t0 = time.time()
+        prev = None
         for k, q in enumerate(qs):
-            self.move_q(q)
+            self.move_q(q, _move_time=dt, _prev=prev)
+            prev = np.clip(np.asarray(q, dtype=float), Q_LIM[:, 0], Q_LIM[:, 1])
             log_t.append(time.time() - t0)
             log_q.append(self.read_q())
             sleep = t0 + (k + 1) * dt - time.time()
@@ -499,9 +634,18 @@ class OMX:
         if self.simulate:
             self._roll_sim = a
             return
-        self._write(ROLL_ID, ADDR_GOAL_POSITION, 4, t)
+        self._roll_goal(t)
         if wait:
             self._wait_servo(ROLL_ID, t, timeout)
+
+    def _roll_goal(self, ticks):
+        """Wrist roll (ID 15) to ticks; on a time-based profile its move time comes first, from its own speed limits."""
+        if ROLL_ID in self._timed:
+            d = (ticks - _s32(self._read(ROLL_ID, ADDR_PRESENT_POSITION, 4))) * RAD_PER_TICK
+            ta_ms, T_ms = self._profile_ms([ROLL_ID], [d])[0]
+            self._write(ROLL_ID, ADDR_PROFILE_ACCEL, 4, ta_ms)
+            self._write(ROLL_ID, ADDR_PROFILE_VELOCITY, 4, T_ms)
+        self._write(ROLL_ID, ADDR_GOAL_POSITION, 4, ticks)
 
     def read_extra(self):
         """(roll angle in rad, gripper opening as a fraction 0 closed .. 1 open) - the two masked axes."""
@@ -530,7 +674,7 @@ class OMX:
     def home(self, wait=True):
         """Home pose (HOME_Q); from the rest region it unfolds via REST_VIA_Q first (see REST_Q)."""
         if not self.simulate:
-            self._write(ROLL_ID, ADDR_GOAL_POSITION, 4, ROLL_TICKS)
+            self._roll_goal(ROLL_TICKS)
         near_rest = np.max(np.abs(np.asarray(self.read_q()) - REST_Q)) < np.radians(25)
         if near_rest:
             self.move_q(REST_VIA_Q, wait=True)

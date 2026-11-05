@@ -6,6 +6,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import cv2
 from scipy.spatial.transform import Rotation as _Rot
+try:
+    import roboticstoolbox as rtb   # Lab 6 uses the toolbox (jtraj, ctraj)
+    from spatialmath import SE3
+except ImportError:
+    rtb = SE3 = None
 NOM = {'d1': 0.0975, 'l2z': 0.11315, 'l2x': 0.0415, 'l3': 0.162, 'l4': 0.123}
 Q_LIM = np.array([[-2.618, 2.618], [-1.868, 1.658], [-1.571, 1.676], [-1.745, 1.745]])
 def small_T(v):
@@ -223,3 +228,73 @@ def camera_ik(p_C, view_pitch, T_EC, elbow='up', par=NOM):
         return None                      # the tool point would be behind the joint-1 axis
     p_tool = [r * np.cos(q1), r * np.sin(q1), z]
     return omx_ik(p_tool, pitch, elbow, par)   # your Task 2
+
+# ---- Lab 5 Task 1: The Jacobian from the joint axes
+def revolute_jacobian(q, p=NOM):
+    """6x4 Jacobian (v; w) of the OMX tool point in the base frame: column i = (z_i x (p_E - p_i), z_i)."""
+    q = np.asarray(q, float)
+    # where the tool point is (Lab 3's FK)
+    p_E = omx_fk(q, p)[:3, 3]
+    # joint 1: the vertical axis through the origin
+    z_1 = np.array([0.0, 0.0, 1.0])
+    p_1 = np.zeros(3)
+    # joints 2-4: the same horizontal axis, y turned by q1
+    y_1 = rotz(q[0]) @ np.array([0.0, 1.0, 0.0])
+    # a point on each pitch axis, along the ETS of Lab 3: the shoulder (height d1), then the elbow (link 2 turned by q1 and q2),
+    # then the wrist (link 3 turned by q1, q2 and q3)
+    p_2 = np.array([0.0, 0.0, p['d1']])                                   # the shoulder
+    R_2 = rotz(q[0]) @ roty(q[1])
+    p_3 = p_2 + R_2 @ np.array([p['l2x'], 0.0, p['l2z']])                 # the elbow
+    R_3 = R_2 @ roty(q[2])
+    p_4 = p_3 + R_3 @ np.array([p['l3'], 0.0, 0.0])                       # the wrist
+    # one column per joint: list the four axes and the four points, then loop over them into a 6 x 4 array
+    axes = [z_1, y_1, y_1, y_1]
+    points = [p_1, p_2, p_3, p_4]
+    J = np.zeros((6, 4))
+    for i in range(4):
+        # equation (4): the velocity part, then the angular part
+        J[:3, i] = np.cross(axes[i], p_E - points[i])
+        J[3:, i] = axes[i]
+    return J
+
+def jacobian_numeric(fk, q, h=1e-6):
+    """3x4 translational Jacobian d p / d q of fk at q, by central differences."""
+    q = np.asarray(q, float)
+    n = len(q)
+    J = np.zeros((3, n))
+    for i in range(n):
+        # nudge joint i alone, by +h and by -h
+        dq = np.zeros(n)
+        dq[i] = h
+        p_plus = fk(q + dq)[:3, 3]
+        p_minus = fk(q - dq)[:3, 3]
+        # the central difference is column i
+        J[:, i] = (p_plus - p_minus) / (2 * h)
+    return J
+
+# ---- Lab 5 Task 2: Manipulability and conditioning
+def manipulability(J):
+    """Yoshikawa measure sqrt(det(J J^T))."""
+    # equation (9): the volume of the velocity ellipsoid, sqrt(det(J J^T))
+    d = np.linalg.det(J @ J.T)
+    # at a singularity rounding can make the determinant a tiny negative number: treat that as zero
+    if d < 0:
+        d = 0.0
+    return float(np.sqrt(d))
+
+def condition_number(J):
+    """sigma_max / sigma_min of J."""
+    # the singular values of J (np.linalg.svd with compute_uv=False) come largest first
+    s = np.linalg.svd(J, compute_uv=False)
+    # the longest semi-axis over the shortest
+    return float(s[0] / s[-1])
+
+# ---- Lab 5 Task 3: Static joint torques from an end-effector force
+def static_torque(Jv, force):
+    """tau = Jv^T f. Jv 3x4, force (3,) N -> tau (4,) N m."""
+    # make both arrays (the force may come in as a list)
+    Jv = np.asarray(Jv)
+    f = np.asarray(force, float)
+    # equation (10): tau = J^T w, the force part of the wrench only, so the 3 x 4 Jv transposed times f
+    tau = Jv.T @ f
+    return tau

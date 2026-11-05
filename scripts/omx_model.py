@@ -31,8 +31,10 @@ HOME_Q = np.radians([0.0, -60.0, 60.0, 30.0])
 # (30 Sep 2026: -28.0, -54.5, 94.1, -0.8 deg), rounded 5 deg AWAY from contact: tip ~22 mm above the table. With torque off
 # the arm then settles the last few mm; nothing is pressed (the earlier (-30, -50, 85, 80) pose drove the gripper into
 # the table and base and tripped its voltage protection). Reached via REST_VIA_Q (home with the wrist already up): with
-# velocity-based profiles the joints arrive at different times, and a direct home -> rest move could put the tip 23 mm
-# below the table if joints 2-3 finished before the wrist; via the waypoint the tip stays >= 22 mm for any joint order.
+# velocity-based profiles (until 30 Oct 2026) the joints arrived at different times, and a direct home -> rest move could put
+# the tip 23 mm below the table if joints 2-3 finished before the wrist; via the waypoint the tip stays >= 22 mm for any joint
+# order. The time-based profile moves the joints together (the direct line's lowest tip point is the rest pose itself, 21.7 mm);
+# the waypoint is kept anyway.
 REST_Q = np.radians([-30.0, -55.0, 95.0, -5.0])
 REST_VIA_Q = np.radians([0.0, -60.0, 60.0, -5.0])
 
