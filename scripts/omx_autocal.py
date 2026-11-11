@@ -8,10 +8,10 @@ view, grabs the frame, and fits the intrinsics (K, lens distortion) from the mat
     from omx_autocal import auto_calibrate                    # from a notebook, after the connect cell
     K, dist, rms = auto_calibrate(arm, cam, ARM_ID, show=True)
 
-Two stages, so that nothing depends on the camera mount (T_EC in omx_model is a CAD placeholder: working out the real one is the
-students' job; the first real mount was measured at 58.6 deg below the gripper axis, 29 Sep 2026):
-  1. bootstrap - 20 poses aimed at the mat around x = 200 mm with a GUESSED mount (MOUNT_PRIOR_DEG = 60, chosen to work for
-     mounts of 45-70 deg; with fewer than 6 good views it falls back to a mount-independent pitch sweep). Frames showing >= 5
+Two stages, so that nothing depends on the camera mount (T_EC in omx_model is the design value, 38 deg below the gripper axis; each
+arm's camera sits a little differently, and the notebooks leave measuring it to the students):
+  1. bootstrap - 20 poses aimed at the mat around x = 200 mm with a GUESSED mount (MOUNT_PRIOR_DEG = 38, the design mount, chosen to
+     work for mounts of 28-48 deg; with fewer than 6 good views it falls back to a mount-independent pitch sweep). Frames showing >= 5
      markers give a first K and distortion, and then the camera mount T_EC from each view's mat pose (mat frame = base frame,
      nominal kinematics).
   2. planned views - calibration_views() with the MEASURED mount and camera: reachable within the joint limits, tip >= 50 mm
@@ -32,15 +32,15 @@ from scipy.spatial.transform import Rotation as Rot
 
 from omx_model import omx_ik, T_EC, Q_LIM, HOME_Q
 from omx_calib import fk_np, NOMINAL
-from omx_camera import load_mat
+from omx_camera import load_mat, LiveWindow
 
 K_NOMINAL = np.array([[950.0, 0, 640], [0, 950.0, 360], [0, 0, 1]])
 SIZE = (1280, 720)
 HOME = HOME_Q
-# Stage 1 aims the camera with a GUESSED mount (the mount is then measured, never taken from this): the first arm measured
-# 58.6-62.0 deg below the gripper axis, camera ~(-24, 0, 20) mm in {E} (29-30 Sep 2026). A mount far from it falls back to sweep_views.
-MOUNT_PRIOR_DEG = 60.0
-MOUNT_PRIOR_T = (-0.024, 0.0, 0.020)
+# Stage 1 aims the camera with a GUESSED mount (the mount is then measured, never taken from this): the design mount omx_model.T_EC
+# (ROBOTIS CAD, 38 deg below the gripper axis). A mount far from it (the first arm's broken one measured ~62) falls back to sweep_views.
+MOUNT_PRIOR_DEG = 38.0
+MOUNT_PRIOR_T = (-0.0459, 0.0, 0.0332)
 FIT_FLAGS = cv2.CALIB_FIX_ASPECT_RATIO | cv2.CALIB_FIX_K3 | cv2.CALIB_ZERO_TANGENT_DIST | cv2.CALIB_USE_INTRINSIC_GUESS
 
 
@@ -73,7 +73,7 @@ def T_EC_nominal():
 def visible_markers(q, K=K_NOMINAL, size=SIZE, margin=20, corners_M=None, min_px=18, max_incidence_deg=65, dist=None,
                     T_ec=None):
     """Ids of the mat markers fully inside the image (with margin), big enough and not too oblique, at joint angles q
-    (nominal kinematics, mat frame = base frame, camera mount T_ec - default the CAD placeholder)."""
+    (nominal kinematics, mat frame = base frame, camera mount T_ec - default the design mount omx_model.T_EC)."""
     corners_M = load_mat(scale=1.0)[1] if corners_M is None else corners_M
     T_BC = fk_np(q, NOMINAL) @ (T_EC_nominal() if T_ec is None else T_ec)
     T_CB = np.linalg.inv(T_BC)
@@ -111,7 +111,7 @@ def bootstrap_views(min_tip_z=0.08, rolls_deg=None, n=20, mount_deg=MOUNT_PRIOR_
     mount_deg: tool-tip heights 0.12-0.20 m, radii 0.13-0.25 m, base turned up to +/-17 deg, the tool pitch solved so the
     optical axis meets the mat 0.18-0.26 m out. A pose is kept only if it sees >= min_markers for every mount in
     mount_deg +/- mount_spread_deg (and every roll in rolls_deg); n are chosen for diversity in camera height, tilt and azimuth.
-    Checked: all 20 see >= 5 markers for true mounts of 45-70 deg (f 1030 px). The old pitch sweep looked back at the base
+    Checked: all 20 see >= 5 markers for true mounts of 26-54 deg (f 1030 px; prior 38 deg). The old pitch sweep looked back at the base
     with a 60 deg mount (first arm, 30 Sep 2026); mount_deg=None still gives it (sweep_views), the fallback for a mount far
     from the guess."""
     if mount_deg is None:
@@ -182,7 +182,7 @@ def sweep_views(min_tip_z=0.08, rolls_deg=None):
 def calibration_views(n=18, K=K_NOMINAL, size=SIZE, min_markers=8, min_tip_z=0.05, dist=None, T_ec=None, pose_margin_deg=4.0):
     """-> (n, 4) joint configurations for the calibration, diverse in camera height, tilt and azimuth, ordered for short moves.
     Candidates: tool-tip heights, radii and azimuths over the mat and tool pitches 0-125 deg below horizontal; each is checked
-    with the given camera (K, dist) and mount T_ec (default: the CAD placeholder). The nominal kinematics are not exact, so a
+    with the given camera (K, dist) and mount T_ec (default: the design mount). The nominal kinematics are not exact, so a
     view must still see min_markers with the camera turned pose_margin_deg either way about its x and y axes (first arm,
     30 Sep 2026: with the measured mount, the view on the mat drifted up to 18 mm with q4 and 6 of 18 planned views saw only
     4-7 markers; a 4 deg margin under-predicts the count on 30 of that run's 31 views)."""
@@ -255,14 +255,8 @@ class Viewer:
     """Live camera window, kept on top and refreshed constantly (during moves, settling and capture). show=False: no-op."""
 
     def __init__(self, cam, show, title='ELEC3901 automatic camera calibration (q to stop)'):
-        self.cam, self.on, self.win, self.stop, self.kept = cam, show, title, False, 0
-        if show:
-            cv2.namedWindow(self.win, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(self.win, 960, 540)
-            try:
-                cv2.setWindowProperty(self.win, cv2.WND_PROP_TOPMOST, 1)      # in front of VS Code / Jupyter
-            except cv2.error:
-                pass
+        self.cam, self.on, self.stop, self.kept = cam, show, False, 0
+        self.win = LiveWindow(title, size=(960, 540), topmost=True) if show else None   # inline on macOS in a notebook
 
     def frame(self, frame=None, lines=(), flash=False):
         """Show frame (grabbed now if None) with markers outlined and status lines. Returns the frame."""
@@ -278,14 +272,13 @@ class Viewer:
         for k, txt in enumerate([f'kept {self.kept}   {len(i)} markers in view'] + list(lines)):
             cv2.putText(vis, txt, (12, 36 + 32 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 0), 5)
             cv2.putText(vis, txt, (12, 36 + 32 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2)
-        cv2.imshow(self.win, vis)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        if self.win.show(vis) == ord('q'):
             self.stop = True
         return frame
 
     def close(self):
         if self.on:
-            cv2.destroyWindow(self.win); cv2.waitKey(1)
+            self.win.close()
 
 
 def move_and_watch(arm, q, viewer, label, tol=0.02, still_tol=0.003, still_s=0.3, timeout=8.0, roll=None):

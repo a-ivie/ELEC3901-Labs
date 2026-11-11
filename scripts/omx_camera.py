@@ -31,12 +31,109 @@ NOT yet validated on the departmental cameras: check the device index and resolu
 """
 import json
 import os
+import sys
+import time
 import numpy as np
 import cv2
 from spatialmath import SE3
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+INLINE_ENV = 'ELEC3901_INLINE'   # 1: live views as pictures in the notebook output, 0: OpenCV / MuJoCo windows; unset: inline on macOS in a notebook
+
+
+def in_notebook():
+    """True inside a Jupyter kernel (VS Code or the browser), False in a terminal script."""
+    try:
+        from IPython import get_ipython
+        ip = get_ipython()
+        return ip is not None and 'IPKernelApp' in ip.config
+    except Exception:
+        return False
+
+
+def use_inline():
+    """Show live views inline (in the cell output) instead of in windows? On macOS a notebook kernel cannot open the MuJoCo viewer
+    (it needs mjpython) and OpenCV windows from it often never appear, so there the default is inline. ELEC3901_INLINE overrides."""
+    v = os.environ.get(INLINE_ENV)
+    if v is not None:
+        return v.strip().lower() not in ('', '0', 'false', 'no')
+    return sys.platform == 'darwin' and in_notebook()
+
+
+class InlineImage:
+    """A live picture in the notebook output, refreshed at most every `period` s (a new picture in each cell that is run)."""
+
+    def __init__(self, period=0.2, width=960):
+        self.period, self.width, self.handle, self.cell, self.t = period, width, None, None, 0.0
+
+    @staticmethod
+    def current_cell():
+        """An id of the cell being run: the kernel's request id (execution_count does not change when history is off)."""
+        from IPython import get_ipython
+        ip = get_ipython()
+        if ip is None:
+            return None
+        try:
+            return ip.kernel.get_parent()['header']['msg_id']
+        except Exception:
+            return ip.execution_count
+
+    def due(self):
+        return time.time() - self.t >= self.period
+
+    def show(self, img, force=False):
+        if not force and not self.due():
+            return
+        from IPython.display import Image, display
+        cell = self.current_cell()
+        h, w = img.shape[:2]
+        if w > self.width:
+            img = cv2.resize(img, (self.width, int(round(h * self.width / w))), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        pic = Image(data=buf.tobytes(), format='jpeg')
+        if self.handle is None or cell != self.cell:
+            self.handle, self.cell = display(pic, display_id=True), cell
+        else:
+            self.handle.update(pic)
+        self.t = time.time()
+
+
+class LiveWindow:
+    """An OpenCV window, or (use_inline()) a picture in the notebook output. show(img) returns the key pressed (-1 if none;
+    there are no keys inline: stop with the notebook's interrupt button)."""
+
+    def __init__(self, title, size=None, topmost=False):
+        self.title, self.inline = title, use_inline()
+        if self.inline:
+            self.pic = InlineImage()
+            print(f'{title}: shown below, updated a few times a second (no keys here; the stop button interrupts)')
+            return
+        cv2.namedWindow(title, cv2.WINDOW_NORMAL)
+        if size is not None:
+            cv2.resizeWindow(title, *size)
+        if topmost:
+            try:
+                cv2.setWindowProperty(title, cv2.WND_PROP_TOPMOST, 1)      # in front of VS Code / Jupyter
+            except cv2.error:
+                pass
+
+    def show(self, img, force=False):
+        """force: inline, show this picture even if the last one was less than a refresh period ago (a single frame)."""
+        if self.inline:
+            self.pic.show(img, force)
+            return -1
+        cv2.imshow(self.title, img)
+        return cv2.waitKey(1) & 0xFF
+
+    def close(self, last=None):
+        """Close the window; inline, the last picture (or `last`) stays in the output."""
+        if self.inline:
+            if last is not None:
+                self.pic.show(last, force=True)
+            return
+        cv2.destroyWindow(self.title); cv2.waitKey(1)
 MAT_FILE = os.path.join(HERE, 'mat_markers.json')
+STALE_AFTER_S = 0.25   # Camera.read() after a gap this long (an arm move) first throws one decoded image away: it is from before the gap
 
 
 def mat_scale_setting():
@@ -75,6 +172,9 @@ def list_cameras():
 
 def find_camera(name):
     """Index of the first camera whose name contains `name` (case-insensitive), e.g. 'Innomaker'."""
+    if sys.platform == 'darwin':
+        raise IOError(f'macOS: OpenCV cannot find a camera by name ({name!r}); use its number instead, e.g. CAM_INDEX = 0 or 1 '
+                      '(on a MacBook 0 is often its own camera)')
     cams = list_cameras()
     for i, n in cams:
         if name.lower() in n.lower():
@@ -96,11 +196,14 @@ class Camera:
             self.cap = cv2.VideoCapture(index)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))   # compressed: full frame rate at 1280x720
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)                     # ask for no queue (not every backend honours it)
+        if sys.platform != 'darwin':                                 # macOS (AVFoundation) supports neither: leave them alone
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))   # compressed: full frame rate at 1280x720
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)                 # ask for no queue (not every backend honours it)
         if not self.cap.isOpened():
             raise IOError(f'camera {self.name or index} not found')
+        self._wait_for_picture(index)
         self.K = self.dist = None
+        self._t_read = 0.0                                          # time of the last read (stale-frame guard)
         if intrinsics is not None:
             self.load_intrinsics(intrinsics)
         self.meta, self.corners_M = load_mat(mat_file, mat_scale)     # mat_scale None: ELEC3901_MAT_SCALE or 1.0
@@ -125,7 +228,8 @@ class Camera:
         After the fit, prints the reprojection error of every kept frame, worst first."""
         import time as _t
         obj_all, img_all, info, size = [], [], [], None
-        t0 = _t.time(); last = None; prev = {}; flash = 0; win = 'ELEC3901 camera calibration (q to stop)'
+        t0 = _t.time(); last = None; prev = {}; flash = 0; vis = None
+        win = LiveWindow('ELEC3901 camera calibration (q to stop)') if show else None
         while len(obj_all) < n_frames and _t.time() - t0 < seconds:
             frame = self.read(flush=1)
             size = frame.shape[1::-1]
@@ -162,13 +266,12 @@ class Camera:
                         (f'sharpness {sharp:.0f}   vary height 90-180 mm, tilt +/-30-40 deg', (255, 255, 255))]):
                     cv2.putText(vis, txt, (12, 32 + 30 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 4)
                     cv2.putText(vis, txt, (12, 32 + 30 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.75, col, 2)
-                cv2.imshow(win, vis)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                if win.show(vis) == ord('q'):
                     break
             else:
                 _t.sleep(0.05)
         if show:
-            cv2.destroyWindow(win); cv2.waitKey(1)
+            win.close(vis)
         if len(obj_all) < 8:
             raise RuntimeError(f'only {len(obj_all)} usable frames - move the camera over the mat, 90-180 mm up, tilting it')
         K, dist, rms, kept = self.calibrate_sets(obj_all, img_all, size, K0)
@@ -216,6 +319,26 @@ class Camera:
             rms, K, dist, rv, tv = _cal([obj_all[k] for k in keep], [img_all[k] for k in keep])
         return K, dist, rms, len(keep)
 
+    def _wait_for_picture(self, index, seconds=3.0):
+        """Read until a frame is not black. macOS gives black frames for a moment after opening, and for good when the program
+        running Python (VS Code, Terminal) has no camera permission: say so here rather than fail later with 'no markers'."""
+        import time as _t
+        t0 = _t.time(); ok = False
+        while _t.time() - t0 < seconds:
+            ok, frame = self.cap.read()
+            if ok and frame is not None and frame.max() > 8:
+                return
+            _t.sleep(0.05)
+        self.cap.release()
+        what = 'gives only black images' if ok else 'gives no images'
+        if sys.platform == 'darwin':
+            hint = ('On macOS: (1) System Settings > Privacy & Security > Camera: allow Visual Studio Code (and Terminal), then quit '
+                    'and reopen VS Code; (2) nothing else may hold the camera: another notebook, Photo Booth, Teams, or a second '
+                    'cv2.VideoCapture in this kernel (release it or restart the kernel); (3) try the other number (0 or 1).')
+        else:
+            hint = 'Check the cable, that nothing else (another notebook, Teams) holds the camera, and the camera number.'
+        raise IOError(f'camera {self.name or index} opened but {what} for {seconds:.0f} s. {hint}')
+
     def drain(self, seconds=0.5):
         """Throw frames away for `seconds`. Use after the arm stops: webcams queue frames, so a read straight after a move can
         return an image from BEFORE it (a fixed number of flushed frames is not enough at a low frame rate)."""
@@ -223,11 +346,21 @@ class Camera:
         t0 = _t.time()
         while _t.time() - t0 < seconds:
             self.cap.grab()
+        self.cap.read()                                 # grab() alone left one stale image on the first arm: decode one too
+        self._t_read = _t.time()
 
     def read(self, flush=3):
+        """The current image. After a gap of more than STALE_AFTER_S since the last read (e.g. an arm move) one decoded image is
+        thrown away first: on the first arm (OMX-00, 9 Oct 2026) the first image after a move was from BEFORE it - up to 229 mm off
+        in C_T_M - even after drain(0.3) and the flushed grabs, and one discarded decoded read removed it. Back-to-back reads (live
+        view, calibration) do not pay for it."""
+        import time as _t
+        if _t.time() - self._t_read > STALE_AFTER_S:
+            self.cap.read()
         for _ in range(flush):                          # drop buffered frames so the image matches 'now'
             self.cap.grab()
         ok, frame = self.cap.read()
+        self._t_read = _t.time()
         if not ok:
             raise IOError('frame grab failed')
         return frame
@@ -279,7 +412,15 @@ class Camera:
         return SE3.Rt(R, t), len(Ts)
 
     def show(self, T_EC=None):
-        """Live annotated view. Press q to quit."""
+        """Live annotated view. Press q to quit (inline: the notebook's stop button)."""
+        win = LiveWindow('ELEC3901 wrist camera')
+        try:
+            self._show_loop(win)
+        except KeyboardInterrupt:
+            pass
+        win.close()
+
+    def _show_loop(self, win):
         while True:
             frame = self.read(flush=1)
             corners, ids = self.detect(frame)
@@ -290,10 +431,8 @@ class Camera:
                 cv2.drawFrameAxes(frame, self.K, self.dist, rvec, T.t, 0.05)
                 cv2.putText(frame, f'{n} markers  reproj {rms:.2f} px  t_CM = {np.round(T.t*1e3,1)} mm',
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv2.imshow('ELEC3901 wrist camera', frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            if win.show(frame) == ord('q'):
                 break
-        cv2.destroyAllWindows()
 
     def focus_check(self, frame=None):
         """Sharpness (variance of Laplacian) and marker count. Compare against the value

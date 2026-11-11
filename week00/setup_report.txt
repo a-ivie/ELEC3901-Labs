@@ -1,0 +1,18 @@
+Windows 10 AMD64
+OK    Python                       3.11.16
+OK    numpy                        2.4.6
+OK    scipy                        1.17.1
+OK    matplotlib                   3.11.2
+OK    opencv-contrib-python        5.0.0.93
+OK    spatialmath-python           1.1.18
+OK    roboticstoolbox-python       1.4.4
+OK    swift-sim                    2.0.1
+OK    dynamixel-sdk                4.1.0
+OK    pyserial                     3.5
+OK    pygrabber                    0.2
+OK    jupyterlab                   4.6.4
+OK    mujoco                       3.14.0
+OK    git                          git version 2.56.0.windows.1
+OK    git user.name                set
+OK    git user.email               set
+ALL CHECKS PASSED
