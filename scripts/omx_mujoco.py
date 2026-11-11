@@ -1,12 +1,13 @@
 """
 omx_mujoco.py - MuJoCo digital twin of the ELEC3901 work cell (OMX + base plate + mat + wrist camera).
 
-    pip install mujoco          (3.x; CPU only, Windows/macOS/Linux)
+    pip install mujoco          (3.x or 4.x; CPU only, Windows/macOS/Linux)
 
 Drop-in replacement for the hardware wrapper:
 
     from omx_mujoco import OMXSim, SimCamera
     arm = OMXSim(view=True)             # opens the MuJoCo viewer; view=False for headless
+    arm = OMXSim(view='web')            # or: the scene in a web browser (MuJoCo >= 4.0 on Linux/macOS/WSL, see WebViewer)
     cam = SimCamera(arm)                # same API as omx_camera.Camera, frames rendered from the wrist camera
     arm.torque(True); arm.set_profile(60, 20); arm.move_q([0, 0.5, -0.2, 1.27], wait=True)
     T_CM, n = cam.mat_pose()            # ArUco pipeline on the rendered image
@@ -57,6 +58,7 @@ mat_flip=(False, False) confirmed (0.6 px overhead projection error), wrist-came
 calibration on a twin with hidden errors: tip error 4.95 mm nominal -> 0.35 mm after the touch test.
 """
 import os
+import sys
 import time
 import numpy as np
 from scipy.spatial.transform import Rotation as Rot
@@ -66,6 +68,11 @@ try:
     _MJ = True
 except ImportError:
     _MJ = False
+
+# The wall clock, kept at import: a test harness may map time.sleep / perf_counter onto the simulated clock (the assignment
+# scorer does), and the browser view still has to be paced in real time.
+_REAL_SLEEP = time.sleep
+_REAL_CLOCK = time.perf_counter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAT_PNG = os.path.join(HERE, 'ELEC3901_mat_A3.png')
@@ -301,6 +308,10 @@ class OMXSim:
                  cam_f_px=950.0, mat_flip=(False, False), objects=None, contacts=False, realtime=True, **mjcf_kw):
         if not _MJ:
             raise ImportError('pip install mujoco')
+        if view == 'web':
+            problem = web_viewer_problem()                # before building anything: MuJoCo 3.x, or 4.0 on Windows
+            if problem:
+                raise RuntimeError('view="web": ' + problem)
         self.kin = dict(NOMINAL); self.kin.update(kin_error or {})
         self.off = np.zeros(4) if joint_offsets is None else np.asarray(joint_offsets, float)
         self.T_EC_true = (T_EC_TWIN if T_EC_true is None else np.asarray(T_EC_true, float)) @ (
@@ -341,7 +352,10 @@ class OMXSim:
         if contacts:                                  # start folded at rest, as on the bench (q = 0 would reach through the stands)
             self.data.qpos[:4] = REST_Q + self.off
         mujoco.mj_forward(self.model, self.data)
-        if view:
+        if view == 'web':
+            self.viewer = WebViewer(self.model, self.data)
+            self.hooks.append(self.viewer.step_hook)
+        elif view:
             self.viewer = open_viewer(self.model, self.data)
 
     # ---- internals ----------------------------------------------------------
@@ -699,6 +713,137 @@ class InlineViewer:
     def close(self):
         if self.running:
             self.sync(force=True); self.renderer.close(); self.running = False
+
+
+WEB_DOC = 'https://mujoco.readthedocs.io/en/stable/studio/web_viewers.html'
+WEB_WINDOWS_ISSUE = 'https://github.com/google-deepmind/mujoco/issues/3580'
+
+
+def web_viewer_problem():
+    """None if MuJoCo Studio's browser view can run here; otherwise why not and what to do (one message).
+    It needs MuJoCo 4.0 or later, and the 4.0.0 wheels for Windows leave it out (WEB_WINDOWS_ISSUE): on Windows, run under
+    WSL (Linux) or use view=True, the MuJoCo window."""
+    if not _MJ:
+        return 'MuJoCo is not installed: pip install mujoco'
+    version = mujoco.__version__
+    try:
+        major = int(version.split('.')[0])
+    except ValueError:
+        major = 0
+    if major < 4:
+        return (f'the browser view needs MuJoCo 4.0 or later, and this is MuJoCo {version}. Update it by uninstalling first '
+                '(upgrading 3.x in place breaks the install): pip uninstall -y mujoco  then  pip install mujoco. '
+                'Or use the MuJoCo window instead (view=True, or --view).')
+    try:
+        from mujoco.studio import launch_web                  # noqa: F401
+        from mujoco.studio.web import headless_ui             # noqa: F401
+    except ImportError as e:
+        if sys.platform == 'win32':
+            return (f'MuJoCo {version} for Windows does not include the browser view ({WEB_WINDOWS_ISSUE}). '
+                    'Use the MuJoCo window (view=True, or --view), or run under WSL (Linux).')
+        return (f'MuJoCo {version} has no browser view here ({e}). If MuJoCo was upgraded from 3.x, repair it with: '
+                'pip install --force-reinstall --no-deps mujoco mujoco-core mujoco-studio')
+    return None
+
+
+def _serve_on_localhost_only():
+    """MuJoCo 4.0's web viewer listens on every network interface, with no password, and has no setting for this (its
+    docs warn about it): anyone on the same network could take control and read file paths. Bind it to 127.0.0.1."""
+    from mujoco.studio import web_viewer
+    from mujoco.studio.web import web_server
+    if getattr(web_server, '_elec3901_localhost', False):
+        return
+    if not hasattr(web_server, 'bind_public_socket') or not hasattr(web_viewer, '_print_url_banner'):
+        raise RuntimeError(f'MuJoCo {mujoco.__version__}: cannot restrict the browser view to this computer, so it is not '
+                           'started. Use view=True (the MuJoCo window).')
+    bind = web_server.bind_public_socket
+    banner = web_viewer._print_url_banner
+
+    def bind_localhost(host, port=0):
+        return bind('127.0.0.1', port)
+
+    def banner_localhost(host, port):
+        return banner('127.0.0.1', port)
+
+    web_server.bind_public_socket = bind_localhost
+    web_viewer._print_url_banner = banner_localhost
+    web_server._elec3901_localhost = True
+
+
+CAMERA_HINT = 'Press [ or ] to switch camera views (the wrist camera, the scene)'
+
+
+def _camera_hint_plugin(text=CAMERA_HINT):
+    """A Studio viewer plugin that keeps a small, see-through line of text at the bottom of the browser view."""
+    from mujoco.studio import messages, plugin
+    from mujoco.studio.dear_imgui import dear_imgui as imgui
+
+    class CameraHint(plugin.ViewerPlugin):
+        @messages.handler
+        def on_build_gui(self, event: messages.BuildGuiEvent) -> None:
+            size = imgui.GetIO().DisplaySize
+            imgui.SetNextWindowPos(imgui.Vec2(0.5 * size.x, size.y - 50), imgui.Cond.Always, imgui.Vec2(0.5, 1.0))
+            imgui.SetNextWindowBgAlpha(0.6)
+            flags = 0
+            for f in ('NoDecoration', 'AlwaysAutoResize', 'NoInputs', 'NoSavedSettings', 'NoFocusOnAppearing', 'NoNav',
+                      'NoDocking'):
+                flags = flags | int(getattr(imgui.WindowFlags, f))
+            visible = imgui.Begin('##camera_hint', None, flags)[0]
+            if visible:
+                imgui.TextUnformatted(text)
+            imgui.End()
+
+    return CameraHint()
+
+
+class WebViewer:
+    """The twin in a web browser: MuJoCo Studio's WebViewer (MuJoCo >= 4.0, WEB_DOC), served on this computer only
+    (http://localhost:<port>/, the first free port from 8080; the address is printed). Physics stays in Python; the browser
+    draws the scene. OMXSim(view='web') starts it and runs step_hook after every physics step: about 60 updates per second,
+    paced to the wall clock, so a twin on the simulated clock (realtime=False, the assignment scorer) plays at real speed.
+    close() waits for Enter when run from a terminal, so the last state stays on screen."""
+
+    def __init__(self, model, data, port=0, title='ELEC3901 digital twin', open_browser=True, fps=60.0):
+        from mujoco.studio import app as studio_app
+        from mujoco.studio import launch_web
+        from mujoco.studio import viewer_protocol
+        _serve_on_localhost_only()
+        config = viewer_protocol.ViewerConfig(title=title, http_port=port, open_browser=open_browser)
+        shown = studio_app.Config(show_options=False, show_inspector=False)   # the scene only; View brings panels back
+        self.handle = launch_web.launch(config, plugins=[studio_app.App(shown), _camera_hint_plugin()])
+        self.handle.set_model(model, data=data)
+        self.period = 1.0 / fps
+        self.wall0 = None                             # wall clock and simulated time when the first step ran
+        self.sim0 = 0.0
+        self.last = -1.0                              # simulated time of the last update sent
+
+    def step_hook(self, sim):
+        t = sim.data.time
+        if self.wall0 is None:
+            self.wall0 = _REAL_CLOCK()
+            self.sim0 = t
+        if t - self.last < self.period:
+            return
+        self.last = t
+        ahead = (t - self.sim0) - (_REAL_CLOCK() - self.wall0)
+        if ahead > 0:
+            _REAL_SLEEP(min(ahead, 1.0))
+        if self.handle.is_running():
+            self.handle.sync(sim.model, sim.data)
+
+    def sync(self):
+        pass                                          # updates are sent from step_hook, every physics step
+
+    def is_running(self):
+        return self.handle.is_running()
+
+    def close(self):
+        if self.handle.is_running() and sys.stdin is not None and sys.stdin.isatty():
+            try:
+                input('Browser view: press Enter to close it. ')
+            except EOFError:
+                pass
+        self.handle.close()
 
 
 def open_viewer(model, data):
