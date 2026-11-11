@@ -298,3 +298,53 @@ def static_torque(Jv, force):
     # equation (10): tau = J^T w, the force part of the wrench only, so the 3 x 4 Jv transposed times f
     tau = Jv.T @ f
     return tau
+
+# ---- Lab 6 Task 1: A straight line in joint angles
+def straight_line_joints(T0, T1, n, ik):
+    """The tool on a straight line from pose T0 to pose T1 in n steps -> (n + 1) x 4 joint angles, ik(T) at every pose."""
+    # the poses along the line, evenly spaced: s from 0 to 1 in n steps (ctraj interpolates the position and the orientation)
+    s = np.linspace(0, 1, n + 1)
+    poses = rtb.ctraj(T0, T1, s=s)
+    # a list for the joint angles, one row per pose
+    out = []
+    # the joint angles for each pose, from the IK; None means out of reach
+    for T in poses:
+        q = ik(T)
+        if q is None:
+            raise ValueError(f'out of reach: {T.t}')
+        out.append(q)
+    return np.array(out)
+
+# ---- Lab 6 Task 2: A move, measured
+def move_metrics(t, q, D):
+    """A logged move: times t (N,), joint angles q (N x 4), distances D (rad) -> (t90 (4,) s, cruise speed of the furthest joint, deg/s)."""
+    t = np.asarray(t, float)
+    q = np.asarray(q, float)
+    # how far each joint has moved at each reading (N x 4)
+    moved = q - q[0]
+    # for each joint, the first reading at or past 90 % of its distance, and its time
+    t90 = []
+    for j in range(len(D)):
+        fraction = moved[:, j] / D[j]
+        first = np.argmax(fraction >= 0.9)
+        t90.append(t[first])
+    # the joint with the furthest to go
+    j_far = int(np.argmax(np.abs(D)))
+    # its speed between consecutive readings, deg/s
+    speeds = np.degrees(np.abs(np.diff(q[:, j_far]) / np.diff(t)))
+    # its cruise: the median speed while it is between 30 % and 70 % of its travel
+    fraction_far = moved[1:, j_far] / D[j_far]
+    cruising = (fraction_far > 0.3) & (fraction_far < 0.7)
+    v_cruise = np.median(speeds[cruising])
+    return np.array(t90), v_cruise
+
+# ---- Lab 6 Task 3: Tracking error metrics
+def tracking_rms(log_q, q_ref):
+    """Per-joint RMS error (deg, 4 values) followed by the overall max |error| (deg)."""
+    # the error at every sample, in degrees
+    e = np.degrees(np.asarray(log_q) - np.asarray(q_ref))
+    # the RMS error of each joint (one value per column)
+    rms = np.sqrt(np.mean(e**2, axis=0))
+    # the largest error anywhere
+    worst = np.max(np.abs(e))
+    return np.append(rms, worst)

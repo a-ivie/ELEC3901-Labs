@@ -94,6 +94,38 @@ def omx_robot(**kw):
     return robot
 
 
+# The OMX-F's link masses, centres of mass and inertias in the standard D-H link frames of omx_dh() (Lab 7). From the digital twin
+# (ROBOTIS's inertials in assets/omx_f; joint 4 carries the wrist, camera bracket and open fingers), moved into the D-H link frames at
+# q = 0 (D. Jones, 8 Nov 2026: Lab 7 uses the toolbox's dynamics on the OMX). D-H, not the ETS model: the toolbox copies a DHRobot
+# correctly, and coriolis() works on it (both fail on the ETS robot in roboticstoolbox 1.1: a copy's links keep their parent pointers
+# to the original). Each: (mass kg, centre of mass r (m) in the link frame, inertia about it [Ixx, Iyy, Izz, Ixy, Iyz, Ixz] kg m^2).
+# Link 4's frame sits at the tool point (D-H a = l4). tests/test_omx_dyn.py checks gravload and inertia equal the twin's.
+LINK_DYN = [
+    (0.065987, [-6.2e-06, 0.0160812, 0.0006049], [2.17317e-05, 1.1658e-05, 2.13515e-05, 0.0, 0.0, 0.0]),
+    (0.0872215, [-0.0213406, -0.0171079, 0.0002978], [4.92366e-05, 9.58362e-05, 0.0001208633, 1.97478e-05, 0.0, 0.0]),
+    (0.0837591, [-0.0746014, 0.0035829, 0.0004131], [1.52031e-05, 0.0002306689, 0.0002260616, 0.0, 0.0, 0.0]),
+    (0.0979673, [-0.0726813, -0.007946, -0.0001036], [4.63858e-05, 6.54668e-05, 8.03045e-05, -8.82e-07, 1.035e-07, 6.031e-07]),
+]
+ARMATURE = 0.01         # kg m^2 per joint: the motor's reflected inertia, as the twin models it
+VISCOUS = 0.05          # N m s/rad per joint, as the twin (rne includes it: B qd); its Coulomb friction (0.1 N m) is left out
+
+
+def omx_dyn():
+    """omx_dh() with the links' masses and inertias (LINK_DYN), so the toolbox's rne, inertia, coriolis, gravload, fdyn and copies
+    work on the OMX. Gravity along -z. The same joint angles, and the same tool point, as omx_robot(). Equal to the digital twin's
+    physics (without its Coulomb friction)."""
+    robot = omx_dh()
+    for link, (m, r, I) in zip(robot.links, LINK_DYN):
+        link.m = m
+        link.r = r
+        link.I = I
+        link.Jm = ARMATURE
+        link.G = 1.0
+        link.B = VISCOUS
+    robot.name = 'OMX (dynamics)'
+    return robot
+
+
 def omx_dh():
     """Standard DH version of the same arm (for comparison with the ETS model).
 

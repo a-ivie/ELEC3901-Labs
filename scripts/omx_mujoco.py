@@ -625,7 +625,12 @@ class OMXSim:
     def inertia(self, q_reported=None):
         if q_reported is not None:
             self.set_q(q_reported)
-        M = np.zeros((self.model.nv, self.model.nv)); mujoco.mj_fullM(self.model, M, self.data.qM)
+        mujoco.mj_forward(self.model, self.data)
+        nv = self.model.nv; M = np.zeros((nv, nv)); col = np.zeros(nv)        # column by column: M e_i (works whatever the
+        for i in range(nv):                                                      # MuJoCo version stores qM as)
+            e = np.zeros(nv); e[i] = 1.0
+            mujoco.mj_mulM(self.model, self.data, col, e)
+            M[:, i] = col
         return M[:4, :4]
 
     def true_T_BE(self):
