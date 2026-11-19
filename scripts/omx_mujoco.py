@@ -279,7 +279,8 @@ def build_mjcf(kin=NOMINAL, T_EC=T_EC_NOMINAL, mat_T=np.eye(4), cam_res=(1280, 7
                 </body>
               </body>
               {fingers}
-              <site name="ee" pos="{l4:.5f} 0 0" size="0.003"/>
+              <!-- the EE point; group 3 is not drawn (MuJoCo shows site groups 0-2), so it no longer hides target markers in the wrist camera -->
+              <site name="ee" pos="{l4:.5f} 0 0" size="0.003" group="3"/>
               <camera name="wrist" pos="{cam_pos[0]:.5f} {cam_pos[1]:.5f} {cam_pos[2]:.5f}" quat="{_quat_wxyz(R_mj)}" fovy="{fovy:.4f}"/>
             </body>
           </body>
