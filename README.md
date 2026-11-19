@@ -7,7 +7,7 @@ Your own copy of the lab notebooks. Commit your work and data files here every l
 | `week00/` | The **pre-lab**: do it before week 1 (see its README). |
 | `weekNN/` | This week's notebook. Work in it and commit it. |
 | `data/` | Everything your notebooks save (measurements, calibration results, all tagged with the arm ID). Later labs read it. |
-| `scripts/` | Helper modules, the mat files and `omx_ref.py`. **Do not edit**: staff replace this folder every week. |
+| `scripts/` | Helper modules, the mat files and `omx_ref.py`. **Do not edit**: staff replace this folder every week. Its `README.md` explains the toolboxes the labs use (spatialmath, roboticstoolbox) and the course's `omx_*` modules, with links to their documentation. |
 | `environment.yml`, `requirements.txt`, `.vscode/` | The `elec3901` conda environment and the VS Code set-up. |
 
 - **Before week 1:** the pre-lab in `week00/` (its README; Minerva "Pre-Lab Work" has screenshots): clone this repository in
@@ -22,4 +22,4 @@ Your own copy of the lab notebooks. Commit your work and data files here every l
 - **Never commit** camera or calibration files you did not make, videos, or anything containing personal data.
 - The assessment repository (issued in week 6) is separate. Copy across any code you want to reuse; it is not linked to this one.
 
-Released so far: weeks 1 to 4.
+Released so far: weeks 1 to 7.

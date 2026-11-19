@@ -1,12 +1,13 @@
 """
 omx_mujoco.py - MuJoCo digital twin of the ELEC3901 work cell (OMX + base plate + mat + wrist camera).
 
-    pip install mujoco          (3.x; CPU only, Windows/macOS/Linux)
+    pip install mujoco          (3.x or 4.x; CPU only, Windows/macOS/Linux)
 
 Drop-in replacement for the hardware wrapper:
 
     from omx_mujoco import OMXSim, SimCamera
     arm = OMXSim(view=True)             # opens the MuJoCo viewer; view=False for headless
+    arm = OMXSim(view='web')            # or: the scene in a web browser (MuJoCo >= 4.0 on Linux/macOS/WSL, see WebViewer)
     cam = SimCamera(arm)                # same API as omx_camera.Camera, frames rendered from the wrist camera
     arm.torque(True); arm.set_profile(60, 20); arm.move_q([0, 0.5, -0.2, 1.27], wait=True)
     T_CM, n = cam.mat_pose()            # ArUco pipeline on the rendered image
@@ -18,10 +19,12 @@ Drop-in replacement for the hardware wrapper:
 What is modelled
   * Arm: the ROBOTIS OMX-F (OpenMANIPULATOR-X follower). Meshes and inertials come from the ROBOTIS MuJoCo menagerie
     (`robotis_omx/omx.xml`, Apache-2.0, copied to labs/assets/omx_f); the body chain is re-expressed with the
-    nominal ETS parameters of omx_model.py so that kin_error works. Joint 5 (wrist roll) and the gripper fingers are
-    fixed bodies: the course treats the arm as 4-DOF; the fingers are fixed open (FINGER_OPEN_DEG), as for all camera work.
+    nominal ETS parameters of omx_model.py so that kin_error works. Joint 5 (wrist roll) is a fixed body: the course treats
+    the arm as 4-DOF. The fingers are not actuated: set_gripper() switches between an open pair (FINGER_OPEN_DEG, the default,
+    for camera work) and a closed pair, at once; closed, they show in the wrist camera's image as on the real arm.
   * Actuation: a torque motor per joint driven by a Python position loop at the physics rate (default 1 kHz),
-    with profile-velocity rate limiting, torque saturation at the servo stall torque (XL430 1.4 N m on joints 1-3,
+    following the arm's time-based profile (omx.profile_times: one trapezoid in time shared by the four joints, from the
+    set_profile speed limits; streamed samples are straight lines of one period), torque saturation at the servo stall torque (XL430 1.4 N m on joints 1-3,
     XL330 0.52 N m on joint 4), joint damping / Coulomb friction / rotor armature. This mirrors a Dynamixel in
     position mode; kp, kv, friction and armature are the parameters Lab 8 identifies.
   * Work cell: bench, base plate A, top frame B, the printed mat as a textured plane at z = 0 (base frame),
@@ -32,10 +35,11 @@ What is modelled
   * Hidden truth: pass kin_error / joint_offsets / T_EC_error / mat_error to make the "real" arm differ from the
     nominal model, then test the calibration pipeline against ground_truth().
 
-Contacts (contacts=True): the arm links and a pen held along the tool axis (tip at the EE point, the nominal l4) collide with the
-bench, plate, mat surface and any free bodies placed in the cell, which can then be pushed over. The fingers stay non-colliding
-(they are fixed open for the camera; on the bench a pen attachment holds the pen). The arm starts folded at REST_Q. Default
-contacts=False: nothing collides, as in every lab.
+Contacts (contacts=True): the arm links and the fingers collide with the bench, plate, mat surface and any free bodies placed in
+the cell, which can then be pushed over. Closed, the fingers are one capsule along the tool axis, 'fingertips' (tip at the EE point,
+the l4 of the twin's kinematics): the assignment's touch tool. Open, each finger is a capsule along the finger, 'finger_open1' and
+'finger_open2'. Only the pair that matches the gripper state collides. The arm starts folded at REST_Q. Default contacts=False:
+nothing collides, as in every lab. (Until 1 Nov 2026 the assignment touched with a pen; D. Jones removed it.)
 
 Clock: by default the twin keeps pace with the wall clock (reads advance the physics to real time, as on the bench).
 realtime=False instead advances it by BUS_DT for every read and by the requested time for settle(): runs are deterministic and
@@ -54,6 +58,7 @@ mat_flip=(False, False) confirmed (0.6 px overhead projection error), wrist-came
 calibration on a twin with hidden errors: tip error 4.95 mm nominal -> 0.35 mm after the touch test.
 """
 import os
+import sys
 import time
 import numpy as np
 from scipy.spatial.transform import Rotation as Rot
@@ -63,6 +68,11 @@ try:
     _MJ = True
 except ImportError:
     _MJ = False
+
+# The wall clock, kept at import: a test harness may map time.sleep / perf_counter onto the simulated clock (the assignment
+# scorer does), and the browser view still has to be paced in real time.
+_REAL_SLEEP = time.sleep
+_REAL_CLOCK = time.perf_counter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAT_PNG = os.path.join(HERE, 'ELEC3901_mat_A3.png')
@@ -92,10 +102,28 @@ T_EC_NOMINAL[:3, 3] = [-0.0459, 0.0, 0.0332]
 TWIN_MOUNT_DEG = 38.0
 T_EC_TWIN = T_EC_NOMINAL.copy()
 TORQUE_PER_AMP = STALL_TORQUE / STALL_CURRENT_A     # per joint
-PEN_R, PEN_L = 0.003, 0.035               # pen held along the tool axis (contacts=True): tip radius, length beyond the fingers (m); tip = EE point
+TIP_R, TIP_L = 0.004, 0.030               # closed fingertips (contacts=True): capsule radius and length along the tool axis (m); tip = EE point
+FINGER_R = 0.004                           # open fingers (contacts=True): capsule radius (m), pivot to tip
 BUS_DT = 0.004                             # realtime=False: simulated time one bus read costs (s)
 RAD_PER_TICK = 2 * np.pi / 4096
 VEL_UNIT = 0.229 * 2 * np.pi / 60          # rad/s per Dynamixel profile-velocity unit
+from omx import profile_times, check_stream, ACC_UNIT_RAD_S2, DEFAULT_PROFILE, PROFILE_MS_MAX   # the arm's time-based profile, shared
+
+
+def _trap_s(t, T, ta):
+    """Fraction of the move done at time t into a trapezoid of move time T and ramp time ta (both s), 0 .. 1."""
+    if T <= 0 or t >= T:
+        return 1.0
+    if t <= 0:
+        return 0.0
+    if ta <= 0:
+        return t / T
+    v = 1.0 / (T - ta)                             # cruise speed (fraction per s)
+    if t < ta:
+        return 0.5 * v / ta * t * t
+    if t < T - ta:
+        return v * (t - 0.5 * ta)
+    return 1.0 - 0.5 * v / ta * (T - t) ** 2
 
 # work cell (m) - must match make_baseplate.py / make_mat.py
 SHEET = (0.420, 0.297); MAT_ORIGIN_ON_SHEET = (0.060, 0.1485)
@@ -128,7 +156,7 @@ def build_mjcf(kin=NOMINAL, T_EC=T_EC_NOMINAL, mat_T=np.eye(4), cam_res=(1280, 7
                damping=0.05, frictionloss=0.1, armature=0.01, tau_max=STALL_TORQUE, mat_flip=(False, False),
                timestep=0.001, objects=(), finger_open_deg=None, contacts=False):
     """Return the MJCF XML string for the cell. All lengths in metres. tau_max: per-joint motor limits (N m).
-    contacts: the arm links and the pen collide with the cell and with free bodies in it (collision groups: arm 2, cell 4,
+    contacts: the arm links and the fingers collide with the cell and with free bodies in it (collision groups: arm 2, cell 4,
     objects 1; see the module docstring)."""
     d1, l2z, l2x, l3, l4 = (kin[k] for k in ('d1', 'l2z', 'l2x', 'l3', 'l4'))
     tau_max = np.broadcast_to(np.asarray(tau_max, float), (4,))
@@ -152,7 +180,7 @@ def build_mjcf(kin=NOMINAL, T_EC=T_EC_NOMINAL, mat_T=np.eye(4), cam_res=(1280, 7
     Px0, Px1 = MAT_CENTRE[0] - PLATE[0] / 2, MAT_CENTRE[0] + PLATE[0] / 2
     Py0, Py1 = -PLATE[1] / 2, PLATE[1] / 2
     zf = FRAME_T / 2
-    # collision groups (contacts=True): arm and pen contype 2; an invisible infinite floor at the mat surface 4; bench, plate and frame
+    # collision groups (contacts=True): arm and fingers contype 2; an invisible infinite floor at the mat surface 4; bench, plate and frame
     # 8 (the stands stand on the floor, even where a foot overhangs the plate or the A3 mat); placed objects contype 1, conaffinity 7
     # (each other, the arm, the floor). The arm never collides with itself, the cell never with itself.
     cell_c = ' contype="8" conaffinity="2"' if contacts else ''        # bench, plate, frame: obstacles for the arm only
@@ -160,8 +188,19 @@ def build_mjcf(kin=NOMINAL, T_EC=T_EC_NOMINAL, mat_T=np.eye(4), cam_res=(1280, 7
     floor = ('<geom name="floor" type="plane" size="0 0 1" pos="0 0 0.0003" rgba="0 0 0 0" contype="4" conaffinity="3"/>'
              if contacts else '')                                      # invisible infinite plane at the mat surface: the arm and the stands
     arm_c = ' contype="2" conaffinity="0"' if contacts else ''
-    pen = (f'<geom name="pen" type="capsule" fromto="{l4 - PEN_L:.5f} 0 0 {l4 - PEN_R:.5f} 0 0" size="{PEN_R:.4f}" rgba="0.15 0.25 0.75 1"'
-           f'{arm_c} density="0" condim="3"/>') if contacts else ''
+    fingers = ''                                                       # contact shapes; OMXSim switches them with the gripper
+    if contacts:
+        fingers = (f'<geom name="fingertips" type="capsule" fromto="{l4 - TIP_L:.5f} 0 0 {l4 - TIP_R:.5f} 0 0" size="{TIP_R:.4f}"'
+                   f' rgba="0 0 0 0"{arm_c} density="0" condim="3"/>')
+        x0 = ROLL_X + FINGER_X                                         # finger pivots in link 4; closed tips at the nominal l4
+        for k, (y0, s) in enumerate(((FINGER_Y[0], 1), (FINGER_Y[1], -1))):
+            v = np.array([NOMINAL['l4'] - x0, -0.0016 - y0])           # pivot to closed tip (omx_model.P_TIP_E)
+            c, sn = np.cos(s * _fo), np.sin(s * _fo)
+            v = np.array([c * v[0] - sn * v[1], sn * v[0] + c * v[1]])
+            a = np.array([x0, y0]) + 0.4 * v
+            b = np.array([x0, y0]) + v * (1 - FINGER_R / np.linalg.norm(v))
+            fingers += (f'\n              <geom name="finger_open{k + 1}" type="capsule" fromto="{a[0]:.5f} {a[1]:.5f} 0 {b[0]:.5f} {b[1]:.5f} 0"'
+                        f' size="{FINGER_R:.4f}" rgba="0 0 0 0"{arm_c} density="0" condim="3"/>')
     frame = f"""
     <geom name="frameL" type="box" size="{(fx0-Px0)/2:.4f} {PLATE[1]/2:.4f} {zf:.4f}" pos="{(Px0+fx0)/2:.4f} 0 {zf:.4f}" material="frame"{cell_c}/>
     <geom name="frameR" type="box" size="{(Px1-fx1)/2:.4f} {PLATE[1]/2:.4f} {zf:.4f}" pos="{(Px1+fx1)/2:.4f} 0 {zf:.4f}" material="frame"{cell_c}/>
@@ -226,14 +265,20 @@ def build_mjcf(kin=NOMINAL, T_EC=T_EC_NOMINAL, mat_T=np.eye(4), cam_res=(1280, 7
                 <geom mesh="follower_06_pan_Revised" class="arm"/>
                 <body name="finger1" pos="{FINGER_X:.5f} {FINGER_Y[0]:.5f} 0" euler="0 0 {_fo:.5f}">
                   <inertial pos="0.016164565 0.0012731032 0.00027291598" mass="0.012090677" diaginertia="2.7083287e-06 6.8733728e-06 4.6941881e-06"/>
-                  <geom mesh="follower_07_gripper_motorized" class="finger"/>
+                  <geom name="finger1_open" mesh="follower_07_gripper_motorized" class="finger"/>
                 </body>
                 <body name="finger2" pos="{FINGER_X:.5f} {FINGER_Y[1]:.5f} 0" euler="0 0 {-_fo:.5f}">
                   <inertial pos="0.016164565 0.0012731032 0.00027291598" mass="0.012090677" diaginertia="2.7083287e-06 6.8733728e-06 4.6941881e-06"/>
-                  <geom mesh="follower_08_gripper_gear" class="finger"/>
+                  <geom name="finger2_open" mesh="follower_08_gripper_gear" class="finger"/>
+                </body>
+                <body name="finger1_closed" pos="{FINGER_X:.5f} {FINGER_Y[0]:.5f} 0">
+                  <geom name="finger1_closed" mesh="follower_07_gripper_motorized" class="finger" rgba="0 0 0 0"/>
+                </body>
+                <body name="finger2_closed" pos="{FINGER_X:.5f} {FINGER_Y[1]:.5f} 0">
+                  <geom name="finger2_closed" mesh="follower_08_gripper_gear" class="finger" rgba="0 0 0 0"/>
                 </body>
               </body>
-              {pen}
+              {fingers}
               <site name="ee" pos="{l4:.5f} 0 0" size="0.003"/>
               <camera name="wrist" pos="{cam_pos[0]:.5f} {cam_pos[1]:.5f} {cam_pos[2]:.5f}" quat="{_quat_wxyz(R_mj)}" fovy="{fovy:.4f}"/>
             </body>
@@ -263,6 +308,10 @@ class OMXSim:
                  cam_f_px=950.0, mat_flip=(False, False), objects=None, contacts=False, realtime=True, **mjcf_kw):
         if not _MJ:
             raise ImportError('pip install mujoco')
+        if view == 'web':
+            problem = web_viewer_problem()                # before building anything: MuJoCo 3.x, or 4.0 on Windows
+            if problem:
+                raise RuntimeError('view="web": ' + problem)
         self.kin = dict(NOMINAL); self.kin.update(kin_error or {})
         self.off = np.zeros(4) if joint_offsets is None else np.asarray(joint_offsets, float)
         self.T_EC_true = (T_EC_TWIN if T_EC_true is None else np.asarray(T_EC_true, float)) @ (
@@ -283,9 +332,17 @@ class OMXSim:
         self.tau_ff = np.zeros(4)
         self.tau_limit = self.tau_max.copy()          # per-joint cap (current-based position mode analogue)
         self.q_goal = np.zeros(4); self.q_ref = np.zeros(4)
-        self.vmax = 60 * VEL_UNIT                     # profile velocity (rad/s)
+        self.lim = np.tile(np.array(DEFAULT_PROFILE, float), (4, 1))   # set_profile (velocity, acceleration) per joint
+        self._plan = None                             # the move under way: (start time, q_start, q_goal, T, ta, no-profile mask)
         self.torque_on = False
         self._grip_open = True
+        self._finger_geoms = {}                       # name -> (geom id, material id, contype, conaffinity), see _apply_gripper
+        for n in ('finger1_open', 'finger2_open', 'finger1_closed', 'finger2_closed', 'fingertips', 'finger_open1', 'finger_open2'):
+            g = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, n)
+            if g >= 0:
+                self._finger_geoms[n] = (g, int(self.model.geom_matid[g]), int(self.model.geom_contype[g]),
+                                         int(self.model.geom_conaffinity[g]))
+        self._apply_gripper()
         self.viewer = None
         self._renderer = None
         self._rec = None                              # video recorder state, see record()
@@ -295,15 +352,20 @@ class OMXSim:
         if contacts:                                  # start folded at rest, as on the bench (q = 0 would reach through the stands)
             self.data.qpos[:4] = REST_Q + self.off
         mujoco.mj_forward(self.model, self.data)
-        if view:
+        if view == 'web':
+            self.viewer = WebViewer(self.model, self.data)
+            self.hooks.append(self.viewer.step_hook)
+        elif view:
             self.viewer = open_viewer(self.model, self.data)
 
     # ---- internals ----------------------------------------------------------
     def _servo_loop(self):
         q, qd = self.data.qpos[:4], self.data.qvel[:4]
         if self.torque_on:
-            step = self.vmax * self.dt
-            self.q_ref += np.clip(self.q_goal - self.q_ref, -step, step)
+            if self._plan is not None:
+                t0, q_s, q_g, T, ta, free = self._plan
+                s = _trap_s(self.data.time - t0, T, ta)
+                self.q_ref = np.where(free, q_g, q_s + (q_g - q_s) * s)
             tau = self.kp * (self.q_ref - q) - self.kv * qd + self.tau_ff
             tau = np.clip(tau, -self.tau_limit, self.tau_limit)
         else:
@@ -349,13 +411,29 @@ class OMXSim:
             self._t_sync = time.time()                   # run in real time from now: with torque off the arm drops, as on the bench
         self.torque_on = bool(on)
         if on:
-            self.q_ref = self.data.qpos[:4].copy(); self.q_goal = self.q_ref.copy()
+            self.q_ref = self.data.qpos[:4].copy(); self.q_goal = self.q_ref.copy(); self._plan = None
 
     def set_mode(self, mode, ids=None):
         pass
 
     def set_profile(self, velocity=60, acceleration=20, ids=None):
-        self.vmax = (velocity if velocity > 0 else 1e9) * VEL_UNIT
+        """Speed limits, as omx.OMX.set_profile: each move becomes one trapezoid in time for all four joints."""
+        for j in (range(4) if ids is None else [JOINT_INDEX[i] for i in ids if i in JOINT_INDEX]):
+            self.lim[j] = (velocity, acceleration)
+
+    def _plan_move(self, goal, move_time=None, prev=None):
+        """The time-based profile for a new goal (servo units, with offsets), as omx.OMX.move_q writes it: the move time
+        from the distances read now, rounded to the registers' ms; the shape starts from where the profile is."""
+        V, A = self.lim[:, 0] * VEL_UNIT, self.lim[:, 1] * ACC_UNIT_RAD_S2
+        D = goal - (self.data.qpos[:4] if prev is None else prev)          # stream(): the step between samples
+        if move_time is None:
+            T, ta = profile_times(D, V, A)
+        else:
+            T, ta = max(profile_times(D, V, np.zeros(4))[0], move_time), 0.0
+        T_ms = min(int(np.ceil(T * 1000)), PROFILE_MS_MAX)
+        ta_ms = min(int(round(ta * 1000)), T_ms // 2)
+        self._plan = (self.data.time, self.q_ref.copy(), goal.copy(), T_ms / 1000, ta_ms / 1000, V == 0)
+        self.q_goal = goal
 
     def set_gains(self, name='standard', ids=None):
         """Same call as omx.OMX; the twin's servo model is fitted separately (Lab 8), so the gain set is only recorded."""
@@ -398,20 +476,23 @@ class OMXSim:
         self._catch_up()
         return self.data.ctrl[:4].copy()
 
-    def move_q(self, q, wait=False, tol=0.01, timeout=5.0, roll=None, gripper=None):
+    def move_q(self, q, wait=False, tol=0.01, timeout=5.0, roll=None, gripper=None, _move_time=None, _prev=None):
         q = np.clip(np.asarray(q, float), Q_LIM[:, 0], Q_LIM[:, 1])
         if roll is not None:
             self.set_roll(roll)
         if gripper is not None:
             self.set_gripper(gripper)
         self._catch_up()                                         # finish the time that passed before this command
-        self.q_goal = q + self.off
+        self._plan_move(q + self.off, _move_time, None if _prev is None else _prev + self.off)
         if self._t_sync is None:
             self._t_sync = time.time()
         if wait:
             n = 0
+            t_end = self._plan[0] + self._plan[3]                # the profile's own end: a short move is not done early
             while n * self.dt < timeout:
                 self.step(10); n += 10
+                if self.data.time < t_end:
+                    continue
                 if np.max(np.abs(self.data.qpos[:4] - self.q_goal)) < tol and np.max(np.abs(self.data.qvel[:4])) < 0.05:
                     break
             self._show_final()
@@ -422,21 +503,44 @@ class OMXSim:
             self.viewer.sync(final=True)
 
     def stream(self, qs, dt):
+        """As omx.OMX.stream, including its refusal (check_stream) of samples faster than set_profile allows."""
+        qs = np.clip(np.asarray(qs, float), Q_LIM[:, 0], Q_LIM[:, 1])
+        check_stream(qs, dt, self.lim[:, 0] * VEL_UNIT, self.read_q())
         log_t, log_q = [], []
         n = max(1, int(round(dt / self.dt)))
+        prev = None
         for k, q in enumerate(qs):
-            self.move_q(q)
+            self.move_q(q, _move_time=dt, _prev=prev)
+            prev = np.clip(np.asarray(q, float), Q_LIM[:, 0], Q_LIM[:, 1])
             log_t.append(k * dt); log_q.append(self.read_q())
             self.step(n)
         self._show_final()
         return np.array(log_t), np.array(log_q)
 
     def gripper(self, open_=True):
-        self._grip_open = open_
+        self._grip_open = bool(open_)
+        self._apply_gripper()
 
     def set_gripper(self, g, wait=False, timeout=3.0):
-        """Same call as omx.OMX: 'open', 'closed' or a fraction. The twin's fingers are not actuated; the state is recorded."""
+        """Same call as omx.OMX: 'open', 'closed' or a fraction (above 0.5 = open). The twin's fingers are not actuated: they
+        switch at once between the open and the closed pair (shown, and colliding with contacts=True)."""
         self._grip_open = (g == 'open') if isinstance(g, str) else float(g) > 0.5
+        self._apply_gripper()
+
+    def _apply_gripper(self):
+        """Show the finger pair that matches the gripper state, hide the other; with contacts=True only the shown pair's contact
+        shapes collide (closed: 'fingertips', the touch tool; open: 'finger_open1', 'finger_open2')."""
+        m = self.model
+        show = {'finger1_open', 'finger2_open', 'finger_open1', 'finger_open2'} if self._grip_open else \
+               {'finger1_closed', 'finger2_closed', 'fingertips'}
+        for n, (g, mat, ct, ca) in self._finger_geoms.items():
+            on = n in show
+            if n.startswith('finger1_') or n.startswith('finger2_'):          # visual meshes
+                m.geom_matid[g] = mat if on else -1
+                m.geom_rgba[g] = m.mat_rgba[mat] if on else (0, 0, 0, 0)
+            else:                                                            # contact shapes: never drawn
+                m.geom_contype[g] = ct if on else 0
+                m.geom_conaffinity[g] = ca if on else 0
 
     def set_roll(self, angle, wait=False, timeout=3.0):
         """Same call as omx.OMX. The twin keeps the wrist roll locked at zero (as the labs do); a non-zero request is refused."""
@@ -522,7 +626,7 @@ class OMXSim:
     def set_q(self, q_reported):
         """Teleport (no dynamics) - handy for kinematic checks."""
         self.data.qpos[:4] = np.asarray(q_reported, float) + self.off
-        self.data.qvel[:4] = 0; self.q_ref = self.q_goal = self.data.qpos[:4].copy()
+        self.data.qvel[:4] = 0; self.q_ref = self.q_goal = self.data.qpos[:4].copy(); self._plan = None
         mujoco.mj_forward(self.model, self.data)
 
     def gravity_torque(self, q_reported=None):
@@ -535,7 +639,12 @@ class OMXSim:
     def inertia(self, q_reported=None):
         if q_reported is not None:
             self.set_q(q_reported)
-        M = np.zeros((self.model.nv, self.model.nv)); mujoco.mj_fullM(self.model, M, self.data.qM)
+        mujoco.mj_forward(self.model, self.data)
+        nv = self.model.nv; M = np.zeros((nv, nv)); col = np.zeros(nv)        # column by column: M e_i (works whatever the
+        for i in range(nv):                                                      # MuJoCo version stores qM as)
+            e = np.zeros(nv); e[i] = 1.0
+            mujoco.mj_mulM(self.model, self.data, col, e)
+            M[:, i] = col
         return M[:4, :4]
 
     def true_T_BE(self):
@@ -604,6 +713,137 @@ class InlineViewer:
     def close(self):
         if self.running:
             self.sync(force=True); self.renderer.close(); self.running = False
+
+
+WEB_DOC = 'https://mujoco.readthedocs.io/en/stable/studio/web_viewers.html'
+WEB_WINDOWS_ISSUE = 'https://github.com/google-deepmind/mujoco/issues/3580'
+
+
+def web_viewer_problem():
+    """None if MuJoCo Studio's browser view can run here; otherwise why not and what to do (one message).
+    It needs MuJoCo 4.0 or later, and the 4.0.0 wheels for Windows leave it out (WEB_WINDOWS_ISSUE): on Windows, run under
+    WSL (Linux) or use view=True, the MuJoCo window."""
+    if not _MJ:
+        return 'MuJoCo is not installed: pip install mujoco'
+    version = mujoco.__version__
+    try:
+        major = int(version.split('.')[0])
+    except ValueError:
+        major = 0
+    if major < 4:
+        return (f'the browser view needs MuJoCo 4.0 or later, and this is MuJoCo {version}. Update it by uninstalling first '
+                '(upgrading 3.x in place breaks the install): pip uninstall -y mujoco  then  pip install mujoco. '
+                'Or use the MuJoCo window instead (view=True, or --view).')
+    try:
+        from mujoco.studio import launch_web                  # noqa: F401
+        from mujoco.studio.web import headless_ui             # noqa: F401
+    except ImportError as e:
+        if sys.platform == 'win32':
+            return (f'MuJoCo {version} for Windows does not include the browser view ({WEB_WINDOWS_ISSUE}). '
+                    'Use the MuJoCo window (view=True, or --view), or run under WSL (Linux).')
+        return (f'MuJoCo {version} has no browser view here ({e}). If MuJoCo was upgraded from 3.x, repair it with: '
+                'pip install --force-reinstall --no-deps mujoco mujoco-core mujoco-studio')
+    return None
+
+
+def _serve_on_localhost_only():
+    """MuJoCo 4.0's web viewer listens on every network interface, with no password, and has no setting for this (its
+    docs warn about it): anyone on the same network could take control and read file paths. Bind it to 127.0.0.1."""
+    from mujoco.studio import web_viewer
+    from mujoco.studio.web import web_server
+    if getattr(web_server, '_elec3901_localhost', False):
+        return
+    if not hasattr(web_server, 'bind_public_socket') or not hasattr(web_viewer, '_print_url_banner'):
+        raise RuntimeError(f'MuJoCo {mujoco.__version__}: cannot restrict the browser view to this computer, so it is not '
+                           'started. Use view=True (the MuJoCo window).')
+    bind = web_server.bind_public_socket
+    banner = web_viewer._print_url_banner
+
+    def bind_localhost(host, port=0):
+        return bind('127.0.0.1', port)
+
+    def banner_localhost(host, port):
+        return banner('127.0.0.1', port)
+
+    web_server.bind_public_socket = bind_localhost
+    web_viewer._print_url_banner = banner_localhost
+    web_server._elec3901_localhost = True
+
+
+CAMERA_HINT = 'Press [ or ] to switch camera views (the wrist camera, the scene)'
+
+
+def _camera_hint_plugin(text=CAMERA_HINT):
+    """A Studio viewer plugin that keeps a small, see-through line of text at the bottom of the browser view."""
+    from mujoco.studio import messages, plugin
+    from mujoco.studio.dear_imgui import dear_imgui as imgui
+
+    class CameraHint(plugin.ViewerPlugin):
+        @messages.handler
+        def on_build_gui(self, event: messages.BuildGuiEvent) -> None:
+            size = imgui.GetIO().DisplaySize
+            imgui.SetNextWindowPos(imgui.Vec2(0.5 * size.x, size.y - 50), imgui.Cond.Always, imgui.Vec2(0.5, 1.0))
+            imgui.SetNextWindowBgAlpha(0.6)
+            flags = 0
+            for f in ('NoDecoration', 'AlwaysAutoResize', 'NoInputs', 'NoSavedSettings', 'NoFocusOnAppearing', 'NoNav',
+                      'NoDocking'):
+                flags = flags | int(getattr(imgui.WindowFlags, f))
+            visible = imgui.Begin('##camera_hint', None, flags)[0]
+            if visible:
+                imgui.TextUnformatted(text)
+            imgui.End()
+
+    return CameraHint()
+
+
+class WebViewer:
+    """The twin in a web browser: MuJoCo Studio's WebViewer (MuJoCo >= 4.0, WEB_DOC), served on this computer only
+    (http://localhost:<port>/, the first free port from 8080; the address is printed). Physics stays in Python; the browser
+    draws the scene. OMXSim(view='web') starts it and runs step_hook after every physics step: about 60 updates per second,
+    paced to the wall clock, so a twin on the simulated clock (realtime=False, the assignment scorer) plays at real speed.
+    close() waits for Enter when run from a terminal, so the last state stays on screen."""
+
+    def __init__(self, model, data, port=0, title='ELEC3901 digital twin', open_browser=True, fps=60.0):
+        from mujoco.studio import app as studio_app
+        from mujoco.studio import launch_web
+        from mujoco.studio import viewer_protocol
+        _serve_on_localhost_only()
+        config = viewer_protocol.ViewerConfig(title=title, http_port=port, open_browser=open_browser)
+        shown = studio_app.Config(show_options=False, show_inspector=False)   # the scene only; View brings panels back
+        self.handle = launch_web.launch(config, plugins=[studio_app.App(shown), _camera_hint_plugin()])
+        self.handle.set_model(model, data=data)
+        self.period = 1.0 / fps
+        self.wall0 = None                             # wall clock and simulated time when the first step ran
+        self.sim0 = 0.0
+        self.last = -1.0                              # simulated time of the last update sent
+
+    def step_hook(self, sim):
+        t = sim.data.time
+        if self.wall0 is None:
+            self.wall0 = _REAL_CLOCK()
+            self.sim0 = t
+        if t - self.last < self.period:
+            return
+        self.last = t
+        ahead = (t - self.sim0) - (_REAL_CLOCK() - self.wall0)
+        if ahead > 0:
+            _REAL_SLEEP(min(ahead, 1.0))
+        if self.handle.is_running():
+            self.handle.sync(sim.model, sim.data)
+
+    def sync(self):
+        pass                                          # updates are sent from step_hook, every physics step
+
+    def is_running(self):
+        return self.handle.is_running()
+
+    def close(self):
+        if self.handle.is_running() and sys.stdin is not None and sys.stdin.isatty():
+            try:
+                input('Browser view: press Enter to close it. ')
+            except EOFError:
+                pass
+        self.handle.close()
 
 
 def open_viewer(model, data):

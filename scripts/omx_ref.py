@@ -6,6 +6,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import cv2
 from scipy.spatial.transform import Rotation as _Rot
+try:
+    import roboticstoolbox as rtb   # Lab 6 uses the toolbox (jtraj, ctraj)
+    from spatialmath import SE3
+except ImportError:
+    rtb = SE3 = None
 NOM = {'d1': 0.0975, 'l2z': 0.11315, 'l2x': 0.0415, 'l3': 0.162, 'l4': 0.123}
 Q_LIM = np.array([[-2.618, 2.618], [-1.868, 1.658], [-1.571, 1.676], [-1.745, 1.745]])
 def small_T(v):
@@ -147,3 +152,199 @@ def plot_error_field(pred, meas, scale=10):
     plt.figure(figsize=(7, 5)); plt.quiver(pred[:, 0], pred[:, 1], d[:, 0] * scale, d[:, 1] * scale, angles='xy', scale_units='xy', scale=1, color='r')
     plt.plot(pred[:, 0], pred[:, 1], 'k.'); plt.axis('equal'); plt.grid(); plt.xlabel('x (m)'); plt.ylabel('y (m)')
     plt.title(f'error field (x{scale}); mean {error_stats(pred, meas)[0]:.1f} mm'); plt.show()
+
+# ---- Lab 4 Task 1: Planar two-link inverse kinematics
+def planar_2r(rw, zw, a2, l3, elbow='up'):
+    """Planar 2R IK -> [phi2, phi3] (rad) or None if out of reach."""
+    # the elbow, equation (3): the law of cosines
+    c3 = (rw ** 2 + zw ** 2 - a2 ** 2 - l3 ** 2) / (2 * a2 * l3)
+    if abs(c3) > 1:
+        return None                      # out of reach: no triangle
+    # equation (4): the sign of the sine is the elbow choice
+    s3 = np.sqrt(1 - c3 ** 2)
+    if elbow == 'up':
+        s3 = -s3                         # elbow up: the relative angle is negative
+    phi3 = np.arctan2(s3, c3)
+    # the shoulder, equation (5): towards the wrist point, less the angle the bent elbow adds
+    phi2 = np.arctan2(zw, rw) - np.arctan2(l3 * s3, a2 + l3 * c3)
+    return np.array([phi2, phi3])
+
+# ---- Lab 4 Task 2: Full inverse kinematics of the OMX
+def omx_ik(p, pitch, elbow='up', par=NOM):
+    """Base-frame position p (3,), tool pitch below horizontal (rad) -> q (4,) or None. elbow: 'up', 'down' or 'any'."""
+    if elbow == 'any':                   # try elbow up first, then elbow down
+        q = omx_ik(p, pitch, 'up', par)
+        if q is None:
+            q = omx_ik(p, pitch, 'down', par)
+        return q
+    x = p[0]
+    y = p[1]
+    z = p[2]
+    # step 1, equation (6): joint 1 turns the arm's plane onto the target
+    q1 = np.arctan2(y, x)
+    r = np.sqrt(x ** 2 + y ** 2)
+    # step 2, equation (7): the wrist point, l4 back along the tool, measured from the shoulder
+    rw = r - par['l4'] * np.cos(pitch)
+    zw = z - par['d1'] + par['l4'] * np.sin(pitch)
+    # step 3: the two-link problem (your Task 1)
+    a2 = np.sqrt(par['l2x'] ** 2 + par['l2z'] ** 2)
+    beta = np.arctan2(par['l2x'], par['l2z'])
+    sol = planar_2r(rw, zw, a2, par['l3'], elbow)
+    if sol is None:
+        return None                      # out of reach
+    phi2 = sol[0]
+    phi3 = sol[1]
+    # step 4, equation (8): the OMX's own angles (zero with link 2 at beta, positive = nose down)
+    q2 = (np.pi / 2 - beta) - phi2
+    q3 = (beta - np.pi / 2) - phi3
+    q4 = pitch - q2 - q3
+    q = np.array([q1, q2, q3, q4])
+    # an answer outside the joint limits is no answer
+    if np.any(q < Q_LIM[:, 0]) or np.any(q > Q_LIM[:, 1]):
+        return None
+    return q
+
+# ---- Lab 4 Task 3: Placing the camera with IK
+def camera_ik(p_C, view_pitch, T_EC, elbow='up', par=NOM):
+    """Lens position p_C (3,) in {B}, optical axis view_pitch (rad) below horizontal, mount T_EC -> q (4,) or None."""
+    if hasattr(T_EC, 'A'):
+        T = T_EC.A                       # an SE3: take its 4 x 4 matrix
+    else:
+        T = np.array(T_EC)
+    # equation (13): the tool pitch is the view pitch less the mount's tilt
+    alpha = np.arctan2(-T[2, 2], T[0, 2])
+    pitch = view_pitch - alpha
+    # equation (14): step back from the lens to the tool point, in the arm's plane
+    ox = T[0, 3]
+    oz = T[2, 3]
+    x = p_C[0]
+    y = p_C[1]
+    z_C = p_C[2]
+    q1 = np.arctan2(y, x)
+    r_C = np.sqrt(x ** 2 + y ** 2)
+    r = r_C - ox * np.cos(pitch) - oz * np.sin(pitch)
+    z = z_C + ox * np.sin(pitch) - oz * np.cos(pitch)
+    if r <= 0:
+        return None                      # the tool point would be behind the joint-1 axis
+    p_tool = [r * np.cos(q1), r * np.sin(q1), z]
+    return omx_ik(p_tool, pitch, elbow, par)   # your Task 2
+
+# ---- Lab 5 Task 1: The Jacobian from the joint axes
+def revolute_jacobian(q, p=NOM):
+    """6x4 Jacobian (v; w) of the OMX tool point in the base frame: column i = (z_i x (p_E - p_i), z_i)."""
+    q = np.asarray(q, float)
+    # where the tool point is (Lab 3's FK)
+    p_E = omx_fk(q, p)[:3, 3]
+    # joint 1: the vertical axis through the origin
+    z_1 = np.array([0.0, 0.0, 1.0])
+    p_1 = np.zeros(3)
+    # joints 2-4: the same horizontal axis, y turned by q1
+    y_1 = rotz(q[0]) @ np.array([0.0, 1.0, 0.0])
+    # a point on each pitch axis, along the ETS of Lab 3: the shoulder (height d1), then the elbow (link 2 turned by q1 and q2),
+    # then the wrist (link 3 turned by q1, q2 and q3)
+    p_2 = np.array([0.0, 0.0, p['d1']])                                   # the shoulder
+    R_2 = rotz(q[0]) @ roty(q[1])
+    p_3 = p_2 + R_2 @ np.array([p['l2x'], 0.0, p['l2z']])                 # the elbow
+    R_3 = R_2 @ roty(q[2])
+    p_4 = p_3 + R_3 @ np.array([p['l3'], 0.0, 0.0])                       # the wrist
+    # one column per joint: list the four axes and the four points, then loop over them into a 6 x 4 array
+    axes = [z_1, y_1, y_1, y_1]
+    points = [p_1, p_2, p_3, p_4]
+    J = np.zeros((6, 4))
+    for i in range(4):
+        # equation (4): the velocity part, then the angular part
+        J[:3, i] = np.cross(axes[i], p_E - points[i])
+        J[3:, i] = axes[i]
+    return J
+
+def jacobian_numeric(fk, q, h=1e-6):
+    """3x4 translational Jacobian d p / d q of fk at q, by central differences."""
+    q = np.asarray(q, float)
+    n = len(q)
+    J = np.zeros((3, n))
+    for i in range(n):
+        # nudge joint i alone, by +h and by -h
+        dq = np.zeros(n)
+        dq[i] = h
+        p_plus = fk(q + dq)[:3, 3]
+        p_minus = fk(q - dq)[:3, 3]
+        # the central difference is column i
+        J[:, i] = (p_plus - p_minus) / (2 * h)
+    return J
+
+# ---- Lab 5 Task 2: Manipulability and conditioning
+def manipulability(J):
+    """Yoshikawa measure sqrt(det(J J^T))."""
+    # equation (9): the volume of the velocity ellipsoid, sqrt(det(J J^T))
+    d = np.linalg.det(J @ J.T)
+    # at a singularity rounding can make the determinant a tiny negative number: treat that as zero
+    if d < 0:
+        d = 0.0
+    return float(np.sqrt(d))
+
+def condition_number(J):
+    """sigma_max / sigma_min of J."""
+    # the singular values of J (np.linalg.svd with compute_uv=False) come largest first
+    s = np.linalg.svd(J, compute_uv=False)
+    # the longest semi-axis over the shortest
+    return float(s[0] / s[-1])
+
+# ---- Lab 5 Task 3: Static joint torques from an end-effector force
+def static_torque(Jv, force):
+    """tau = Jv^T f. Jv 3x4, force (3,) N -> tau (4,) N m."""
+    # make both arrays (the force may come in as a list)
+    Jv = np.asarray(Jv)
+    f = np.asarray(force, float)
+    # equation (10): tau = J^T w, the force part of the wrench only, so the 3 x 4 Jv transposed times f
+    tau = Jv.T @ f
+    return tau
+
+# ---- Lab 6 Task 1: A straight line in joint angles
+def straight_line_joints(T0, T1, n, ik):
+    """The tool on a straight line from pose T0 to pose T1 in n steps -> (n + 1) x 4 joint angles, ik(T) at every pose."""
+    # the poses along the line, evenly spaced: s from 0 to 1 in n steps (ctraj interpolates the position and the orientation)
+    s = np.linspace(0, 1, n + 1)
+    poses = rtb.ctraj(T0, T1, s=s)
+    # a list for the joint angles, one row per pose
+    out = []
+    # the joint angles for each pose, from the IK; None means out of reach
+    for T in poses:
+        q = ik(T)
+        if q is None:
+            raise ValueError(f'out of reach: {T.t}')
+        out.append(q)
+    return np.array(out)
+
+# ---- Lab 6 Task 2: A move, measured
+def move_metrics(t, q, D):
+    """A logged move: times t (N,), joint angles q (N x 4), distances D (rad) -> (t90 (4,) s, cruise speed of the furthest joint, deg/s)."""
+    t = np.asarray(t, float)
+    q = np.asarray(q, float)
+    # how far each joint has moved at each reading (N x 4)
+    moved = q - q[0]
+    # for each joint, the first reading at or past 90 % of its distance, and its time
+    t90 = []
+    for j in range(len(D)):
+        fraction = moved[:, j] / D[j]
+        first = np.argmax(fraction >= 0.9)
+        t90.append(t[first])
+    # the joint with the furthest to go
+    j_far = int(np.argmax(np.abs(D)))
+    # its speed between consecutive readings, deg/s
+    speeds = np.degrees(np.abs(np.diff(q[:, j_far]) / np.diff(t)))
+    # its cruise: the median speed while it is between 30 % and 70 % of its travel
+    fraction_far = moved[1:, j_far] / D[j_far]
+    cruising = (fraction_far > 0.3) & (fraction_far < 0.7)
+    v_cruise = np.median(speeds[cruising])
+    return np.array(t90), v_cruise
+
+# ---- Lab 6 Task 3: Tracking error metrics
+def tracking_rms(log_q, q_ref):
+    """Per-joint RMS error (deg, 4 values) followed by the overall max |error| (deg)."""
+    # the error at every sample, in degrees
+    e = np.degrees(np.asarray(log_q) - np.asarray(q_ref))
+    # the RMS error of each joint (one value per column)
+    rms = np.sqrt(np.mean(e**2, axis=0))
+    # the largest error anywhere
+    worst = np.max(np.abs(e))
+    return np.append(rms, worst)
