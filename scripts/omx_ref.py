@@ -348,3 +348,22 @@ def tracking_rms(log_q, q_ref):
     # the largest error anywhere
     worst = np.max(np.abs(e))
     return np.append(rms, worst)
+
+# ---- Lab 7 Task 1: Gravity regressor
+def gravity_regressor(q):
+    """3x4 regressor so that tau[1:4] = gravity_regressor(q) @ theta (the torques the servos apply to hold q)."""
+    s2, c2 = np.sin(q[1]), np.cos(q[1])
+    c23, c234 = np.cos(q[1] + q[2]), np.cos(q[1] + q[2] + q[3])
+    return -np.array([[s2, c2, c23, c234], [0, 0, c23, c234], [0, 0, 0, c234]])
+
+# ---- Lab 7 Task 2: Least-squares identification
+def fit_gravity(Q, TAU):
+    """-> (theta (4,), rms residual in N m)."""
+    A = np.vstack([gravity_regressor(q) for q in Q]); b = np.asarray(TAU)[:, 1:4].reshape(-1)
+    theta, *_ = np.linalg.lstsq(A, b, rcond=None)
+    return theta, float(np.sqrt(np.mean((A @ theta - b) ** 2)))
+
+# ---- Lab 7 Task 3: Predicted gravity torque
+def gravity_torque(q, theta):
+    """-> tau (4,) N m, joint 1 zero."""
+    return np.concatenate([[0.0], gravity_regressor(q) @ np.asarray(theta, float)])
